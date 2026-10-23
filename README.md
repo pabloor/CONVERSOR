@@ -11,9 +11,19 @@ Aplicación de escritorio para pasar sesiones de un DAW a otro.
 | Archivo | Contenido | Se abre en |
 |---|---|---|
 | `.aaf` | Pistas de audio con sus clips en su posición, el audio incrustado, el volumen y el panorama de cada pista (con su automatización) y la ganancia de cada clip | Pro Tools, Logic Pro, Cubase/Nuendo |
-| `.mid` | Pistas MIDI con notas, tempo (incluidos los cambios), compás y panorama | Todos (también FL Studio) |
-| `<sesión> - pistas/` | Un WAV por pista de audio que empieza en el inicio de la sesión, con los clips ya colocados y procesados | Todos: se arrastran al compás 1 |
-| `informe.txt` | Resumen de la sesión, avisos sobre lo que no se ha podido convertir, tabla de mezcla (volumen y panorama de cada pista) y cómo importar en cada DAW | — |
+| `.mid` | Pistas MIDI con notas, envolventes de los clips (pitch bend, presión, controladores), panorama, tempo (incluidos los cambios), compás y marcadores | Todos (también FL Studio) |
+| `<sesión> - pistas/` | Un WAV por pista de audio que empieza en el inicio de la sesión, con los clips ya colocados, procesados y con sus fundidos | Todos: se arrastran al compás 1 |
+| `informe.txt` | Resumen de la sesión, avisos sobre lo que no se ha podido convertir, tabla de mezcla (volumen y panorama de cada pista), efectos e instrumentos de cada pista y cómo importar en cada DAW | — |
+
+Opciones (en la aplicación y en la línea de comandos):
+
+- **Frecuencia de muestreo** del audio exportado, para que coincida con el
+  proyecto de Logic. Por defecto, la más habitual entre los archivos de la sesión.
+- **Omitir las pistas silenciadas.**
+- **Nombre del grupo delante del de cada pista** («Batería - Bombo»), para
+  rehacer los Track Stacks en Logic. Activada por defecto.
+
+Se pueden convertir varias sesiones a la vez: cada una va a su propia carpeta.
 
 Pro Tools, Logic y Cubase guardan sus sesiones en formatos cerrados que no se
 pueden escribir directamente. AAF y MIDI son los formatos de intercambio que
@@ -49,6 +59,8 @@ El objetivo es que el audio suene exactamente como en Ableton:
 - **AIFF, MP3, FLAC u otra frecuencia de muestreo**: se convierten a WAV de 24
   bits a la frecuencia de la sesión.
 - **Clips desactivados**: no se exportan.
+- **Fundidos de los clips**: se aplican en los WAV por pista y se declaran en
+  el AAF (propiedades estándar de fundido, que no todos los DAW leen).
 
 ### De Pro Tools a Ableton Live
 
@@ -83,10 +95,15 @@ etc.
 - No se convierten los efectos y los instrumentos (plugins). Para llevar el
   sonido de una pista MIDI o con efectos, usa en Ableton «Congelar y aplanar»
   (Freeze and Flatten) antes de convertir.
-- No se convierten los fundidos de los clips ni las envolventes dentro de los
-  clips. El informe avisa de los clips con fundidos.
-- Los grupos y los retornos no se convierten, y el silencio y el solo de las
-  pistas tampoco. El informe lo avisa.
+- No se convierten las envolventes de los clips de audio (volumen, transposición
+  dentro del clip).
+- Los grupos y los retornos no se convierten, y el solo de las pistas tampoco.
+  El informe lo avisa.
+- Las notas con probabilidad o variación de velocidad se exportan todas, con
+  su velocidad base. El informe lo avisa.
+- Falta confirmar con sesiones reales las unidades de los fundidos (tiempos en
+  clips con warp, segundos sin warp) y la numeración de los controladores MIDI
+  de las envolventes.
 - En los clips procesados con Rubber Band, los golpes pueden adelantarse unos
   milisegundos, como en cualquier estiramiento de tiempo.
 - Rubber Band (`pylibrb`) necesita Python 3.12 o posterior y no tiene versión
@@ -101,14 +118,23 @@ etc.
 
 ### Aplicación para Mac (chip Apple)
 
-1. En GitHub, abre la pestaña *Actions*, entra en la última ejecución correcta
-   de «Aplicación para Mac» y descarga el artefacto `Conversor-mac`.
-2. Descomprime el ZIP, abre `Conversor.dmg` y arrastra **Conversor** a la
-   carpeta Aplicaciones.
+1. Descarga la última versión:
+   https://github.com/pabloor/CONVERSOR/releases/latest/download/Conversor.dmg
+   (las versiones y sus cambios están en la página *Releases* del repositorio).
+2. Abre `Conversor.dmg` y arrastra **Conversor** a la carpeta Aplicaciones.
 3. La primera vez, macOS la bloquea porque no está firmada por Apple. Ábrela
    con doble clic, cierra el aviso y ve a *Ajustes del Sistema > Privacidad y
    seguridad*. Abajo aparece «Se ha bloqueado Conversor»: pulsa *Abrir
    igualmente* y confirma. Solo hace falta una vez.
+
+Para abrir una sesión, arrástrala a la ventana o al icono del Dock, o usa
+*Abrir con > Conversor* en el Finder.
+
+Para publicar una versión nueva: sube la versión en `pyproject.toml` y
+`src/conversor/__init__.py`, añade sus cambios a `CHANGELOG.md` y sube una
+etiqueta `vX.Y.Z`. GitHub Actions compila la aplicación y crea el Release.
+Cada cambio subido a cualquier rama también deja el `.dmg` en la pestaña
+*Actions* (artefacto `Conversor-mac`).
 
 Para compilarla en tu propio Mac: crea un entorno con el proyecto y PyInstaller
 (`pip install -e . "pyinstaller>=6.10"`) y ejecuta `packaging/build_mac.sh`.
@@ -140,6 +166,7 @@ Línea de comandos:
 ```bash
 conversor "Mi canción.als" -o salida/
 conversor "Mi canción.als" --formato midi
+conversor *.als --frecuencia 48000 --omitir-silenciadas   # varias sesiones
 conversor Cancion.aaf Cancion.mid                # Pro Tools -> Ableton
 conversor Cancion.aaf --tempo 92 --plantilla "Vacío.als"
 ```

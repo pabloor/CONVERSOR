@@ -72,6 +72,9 @@ class AudioClip:
     repitch: bool = False
     # Modo de warp de Ableton, para elegir cómo estirar el audio.
     warp_mode: int | None = None
+    # Fundidos de entrada y salida, en tiempos de la línea de tiempo.
+    fade_in: float = 0.0
+    fade_out: float = 0.0
 
     def playback(self, project: Project) -> list[AudioSegment]:
         if self.segments:
@@ -85,11 +88,27 @@ class AudioClip:
 
 
 @dataclass
+class ControllerEvent:
+    beat: float  # en tiempos, relativo al inicio del clip
+    # "cc" (con number = controlador), "pitchbend" (-8192..8191) o "aftertouch" (0..127)
+    kind: str
+    value: int
+    number: int = 0
+
+
+@dataclass
 class MidiClip:
     name: str
     start: float
     length: float
     notes: list[Note] = field(default_factory=list)
+    controllers: list[ControllerEvent] = field(default_factory=list)
+
+
+@dataclass
+class Marker:
+    beat: float
+    name: str
 
 
 @dataclass
@@ -115,6 +134,8 @@ class Track:
     mute: bool = False
     solo: bool = False
     group: str | None = None
+    # Efectos e instrumentos de la pista, en orden (solo informativo).
+    devices: list[str] = field(default_factory=list)
     audio_clips: list[AudioClip] = field(default_factory=list)
     midi_clips: list[MidiClip] = field(default_factory=list)
     automation: list[Automation] = field(default_factory=list)
@@ -128,6 +149,8 @@ class Project:
         default_factory=lambda: [TimeSignature(0.0, 4, 4)]
     )
     tracks: list[Track] = field(default_factory=list)
+    markers: list[Marker] = field(default_factory=list)
+    master_devices: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     # Audio que aún no existe como archivo (p. ej. incrustado en un AAF):
     # ruta prevista -> función que lo escribe en la ruta de destino indicada.

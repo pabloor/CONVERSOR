@@ -41,7 +41,7 @@ from aaf2.misc import ConstantValue, VaryingValue
 from aaf2.mobid import MobID
 from aaf2.mobs import MasterMob, SourceMob
 
-from ..audio import PreparedAudio, prepare
+from ..audio import PreparedAudio, Region, prepare
 from ..model import (
     AudioClip,
     Automation,
@@ -68,7 +68,7 @@ _TIMECODE_FPS = 25
 _TIMECODE_START = 60 * 60 * _TIMECODE_FPS
 
 
-def write(project: Project, path: str | Path, prepared: PreparedAudio | None = None) -> int:
+def write(project: Project, path: str | Path, prepared: PreparedAudio | None = None, progress=None) -> int:
     """Escribe las pistas de audio del proyecto. Devuelve el número de clips escritos.
 
     Si no se pasa el audio ya preparado, se prepara en una carpeta temporal.
@@ -92,6 +92,8 @@ def write(project: Project, path: str | Path, prepared: PreparedAudio | None = N
         master_mobs: dict[Path, tuple[object, int]] = {}
 
         for number, (track, regions) in enumerate(prepared.tracks, start=1):
+            if progress:
+                progress((number - 1) / max(len(prepared.tracks), 1), f"AAF: {track.name}")
             slot = composition.create_timeline_slot(edit_rate=rate)
             slot.name = track.name
             slot["PhysicalTrackNumber"].value = number
@@ -119,6 +121,7 @@ def write(project: Project, path: str | Path, prepared: PreparedAudio | None = N
                 if start > cursor:
                     sequence.components.append(f.create.Filler("sound", start - cursor))
                 clip = master.create_source_clip(slot_id=1, start=offset, length=length)
+                _set_fades(clip, region, rate, length)
                 if abs(region.gain_db) > 0.01:
                     clip = defs.gain_group(clip, length, constant=db_to_gain(region.gain_db))
                 sequence.components.append(clip)
@@ -126,9 +129,20 @@ def write(project: Project, path: str | Path, prepared: PreparedAudio | None = N
                 clip_count += 1
 
             slot.segment = _track_mixer(project, track, sequence, cursor, rate, defs, f)
-            _warn_mix(project, track)
 
     return clip_count
+
+
+def _set_fades(clip, region: Region, rate: int, length: int) -> None:
+    """Fundidos del clip (propiedades estándar de SourceClip, lineales en amplitud)."""
+    fade_in = min(_samples(region.fade_in, rate), length)
+    fade_out = min(_samples(region.fade_out, rate), length - fade_in)
+    if fade_in > 0:
+        clip["FadeInLength"].value = fade_in
+        clip["FadeInType"].value = "FadeLinearAmp"
+    if fade_out > 0:
+        clip["FadeOutLength"].value = fade_out
+        clip["FadeOutType"].value = "FadeLinearAmp"
 
 
 def _track_mixer(project: Project, track: Track, sequence, length: int, rate: int, defs, f):
@@ -159,15 +173,6 @@ def _track_mixer(project: Project, track: Track, sequence, length: int, rate: in
     elif abs(track.pan) > 0.001:
         segment = defs.pan_group(segment, total, constant=(track.pan + 1) / 2)
     return segment
-
-
-def _warn_mix(project: Project, track: Track) -> None:
-    if track.mute:
-        project.warn(f"La pista '{track.name}' está silenciada en Ableton; se exporta igualmente.")
-    if track.solo:
-        project.warn(f"La pista '{track.name}' tiene el solo activado en Ableton; el solo no se exporta.")
-    if any(a.parameter == "mute" for a in track.automation):
-        project.warn(f"La automatización de silencio de la pista '{track.name}' no se exporta.")
 
 
 class _Definitions:

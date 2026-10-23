@@ -39,6 +39,17 @@ def write(project: Project, path: str | Path) -> int:
         elif abs(track.pan) > 0.001:
             events.append((0, 0, mido.Message("control_change", control=10, value=_pan_cc(track.pan))))
         for clip in track.midi_clips:
+            for event in clip.controllers:
+                tick = _ticks(clip.start + event.beat)
+                if event.kind == "pitchbend":
+                    message = mido.Message("pitchwheel", pitch=max(-8192, min(8191, event.value)))
+                elif event.kind == "aftertouch":
+                    message = mido.Message("aftertouch", value=max(0, min(127, event.value)))
+                else:
+                    message = mido.Message(
+                        "control_change", control=max(0, min(127, event.number)), value=max(0, min(127, event.value))
+                    )
+                events.append((tick, 0, message))
             for note in clip.notes:
                 start = _ticks(clip.start + note.start)
                 end = max(_ticks(clip.start + note.start + note.duration), start + 1)
@@ -48,7 +59,7 @@ def write(project: Project, path: str | Path) -> int:
                 events.append((end, 1, mido.Message("note_off", note=pitch, velocity=0)))
 
         midi_track = mido.MidiTrack()
-        midi_track.append(mido.MetaMessage("track_name", name=track.name, time=0))
+        midi_track.append(mido.MetaMessage("track_name", name=_text(track.name), time=0))
         _append_sorted(midi_track, events)
         midi.tracks.append(midi_track)
         count += 1
@@ -82,8 +93,11 @@ def _conductor(project: Project) -> mido.MidiTrack:
         else:
             events.append((_ticks(beat), 1, _tempo(point.bpm)))
 
+    for marker in project.markers:
+        events.append((_ticks(marker.beat), 2, mido.MetaMessage("marker", text=_text(marker.name or "Marcador"))))
+
     track = mido.MidiTrack()
-    track.append(mido.MetaMessage("track_name", name=project.name, time=0))
+    track.append(mido.MetaMessage("track_name", name=_text(project.name), time=0))
     _append_sorted(track, events)
     return track
 
@@ -98,6 +112,11 @@ def _append_sorted(track: mido.MidiTrack, events: list) -> None:
         track.append(message.copy(time=tick - now))
         now = tick
     track.append(mido.MetaMessage("end_of_track", time=0))
+
+
+def _text(text: str) -> str:
+    """Los textos MIDI se guardan en Latin-1: los caracteres que no caben se sustituyen."""
+    return text.encode("latin-1", "replace").decode("latin-1")
 
 
 def _ticks(beat: float) -> int:

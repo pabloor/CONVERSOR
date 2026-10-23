@@ -31,6 +31,16 @@ if [[ "$(uname)" == "Darwin" ]]; then
     # -replace crea la clave si no existe.
     plutil -replace CFBundleShortVersionString -string "$VERSION" "$plist"
     plutil -replace CFBundleVersion -string "$VERSION" "$plist"
+    # Tipos de archivo que abre: permite soltar sesiones sobre el icono del Dock
+    # y usar «Abrir con > Conversor» en el Finder.
+    plutil -replace CFBundleDocumentTypes -json '[
+        {"CFBundleTypeName": "Sesión de Ableton Live", "CFBundleTypeRole": "Viewer",
+         "LSHandlerRank": "Alternate", "CFBundleTypeExtensions": ["als"]},
+        {"CFBundleTypeName": "AAF", "CFBundleTypeRole": "Viewer",
+         "LSHandlerRank": "Alternate", "CFBundleTypeExtensions": ["aaf"]},
+        {"CFBundleTypeName": "Archivo MIDI", "CFBundleTypeRole": "Viewer",
+         "LSHandlerRank": "Alternate", "CFBundleTypeExtensions": ["mid", "midi"]}
+    ]' "$plist"
     # Firma ad hoc (sin cuenta de desarrollador de Apple) tras editar el Info.plist.
     codesign --force --deep --sign - dist/Conversor.app
 

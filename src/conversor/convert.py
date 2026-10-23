@@ -119,10 +119,26 @@ def convert(
     targets=None,
     template: str | Path | None = None,
     tempo: float | None = None,
+    *,
+    sample_rate: int | None = None,
+    skip_muted: bool = False,
+    group_prefix: bool = True,
+    progress=None,
 ) -> Result:
+    """Convierte una sesión.
+
+    - sample_rate: frecuencia del audio exportado (por defecto, la más habitual en la sesión).
+    - skip_muted: no exportar las pistas silenciadas.
+    - group_prefix: anteponer el nombre del grupo al de cada pista ("Batería - Bombo").
+    - progress(fracción, texto): informa del avance.
+    """
+    report_progress = progress or (lambda fraction, text: None)
     paths = [Path(sources)] if isinstance(sources, (str, Path)) else list(sources)
     targets = targets or default_targets(paths)
+    report_progress(0.0, "Leyendo la sesión")
     project = load(paths, tempo)
+    if _from_ableton(paths):
+        _apply_options(project, skip_muted, group_prefix)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     result = Result(project)
@@ -133,15 +149,15 @@ def convert(
 
     if has_audio and ("aaf" in targets or "stems" in targets):
         with tempfile.TemporaryDirectory(prefix="conversor-") as workdir:
-            prepared = prepare(project, Path(workdir))
+            prepared = prepare(project, Path(workdir), sample_rate, _stage(report_progress, 0.05, 0.7))
             result.rendered_clips = prepared.rendered
             if "aaf" in targets:
                 path = output_dir / f"{name}.aaf"
-                aaf.write(project, path, prepared)
+                aaf.write(project, path, prepared, _stage(report_progress, 0.7, 0.85))
                 result.outputs.append(path)
             if "stems" in targets:
                 folder = output_dir / f"{name} - pistas"
-                write_stems(prepared, folder)
+                write_stems(prepared, folder, _stage(report_progress, 0.85, 0.95))
                 result.outputs.append(folder)
     if "aaf" in targets and has_midi and _from_ableton(paths):
         project.warn(
@@ -149,6 +165,7 @@ def convert(
             "Para llevar también su audio, en Ableton usa «Congelar y aplanar» "
             "(Freeze and Flatten) en esas pistas antes de convertir."
         )
+    report_progress(0.95, "Escribiendo MIDI e informe")
     if "midi" in targets and has_midi:
         path = output_dir / f"{name}.mid"
         midi.write(project, path)
@@ -163,7 +180,68 @@ def convert(
     report = output_dir / f"{name} - informe.txt"
     report.write_text(build_report(result), encoding="utf-8")
     result.outputs.append(report)
+    report_progress(1.0, "Terminado")
     return result
+
+
+def convert_many(sessions, output_root: str | Path | None = None, progress=None, **options) -> list[tuple[Path, Result | Exception]]:
+    """Convierte varias sesiones de Ableton, cada una en su carpeta.
+
+    Sin output_root, cada resultado va junto a su sesión en "<sesión> (convertido)";
+    con output_root, en una subcarpeta con el nombre de la sesión.
+    """
+    results: list[tuple[Path, Result | Exception]] = []
+    sessions = [Path(s) for s in sessions]
+    for index, session in enumerate(sessions):
+        folder = Path(output_root) / session.stem if output_root else default_output(session)
+        stage = _stage(progress or (lambda f, t: None), index / len(sessions), (index + 1) / len(sessions))
+        named = lambda fraction, text, session=session, stage=stage: stage(fraction, f"{session.stem}: {text}")  # noqa: E731
+        try:
+            results.append((session, convert(session, folder, progress=named, **options)))
+        except (OSError, ValueError, SyntaxError) as error:
+            results.append((session, error))
+    return results
+
+
+def default_output(session: Path) -> Path:
+    return session.parent / f"{session.stem} (convertido)"
+
+
+def _stage(progress, start: float, end: float):
+    """Pasa el avance de una etapa (0..1) al tramo [start, end] del total."""
+    return lambda fraction, text: progress(start + (end - start) * min(max(fraction, 0.0), 1.0), text)
+
+
+def _apply_options(project: Project, skip_muted: bool, group_prefix: bool) -> None:
+    if group_prefix:
+        groups = {t.name: t for t in project.tracks if t.kind == TrackKind.GROUP}
+        for track in project.tracks:
+            chain, parent, seen = [], track.group, set()
+            while parent and parent not in seen:
+                seen.add(parent)
+                chain.insert(0, parent)
+                parent = groups[parent].group if parent in groups else None
+            if chain and track.kind in (TrackKind.AUDIO, TrackKind.MIDI):
+                track.name = " - ".join(chain + [track.name])
+    exported = [t for t in project.tracks if t.kind in (TrackKind.AUDIO, TrackKind.MIDI)]
+    muted = [t for t in exported if t.mute]
+    if muted and skip_muted:
+        project.tracks = [t for t in project.tracks if t not in muted]
+        exported = [t for t in exported if t not in muted]
+        project.warn(
+            f"No se exportan {_count(len(muted), 'pista silenciada', 'pistas silenciadas')}: "
+            + ", ".join(t.name for t in muted)
+        )
+    for track in exported:
+        if track.mute:
+            project.warn(
+                f"La pista '{track.name}' está silenciada en Ableton; se exporta igualmente "
+                "(puedes omitir las pistas silenciadas en las opciones)."
+            )
+        if track.solo:
+            project.warn(f"La pista '{track.name}' tiene el solo activado en Ableton; el solo no se exporta.")
+        if any(a.parameter == "mute" for a in track.automation):
+            project.warn(f"La automatización de silencio de la pista '{track.name}' no se exporta.")
 
 
 def _from_ableton(paths) -> bool:
@@ -180,6 +258,8 @@ def summary(project: Project) -> str:
         f"Compás inicial: {signature.numerator}/{signature.denominator}",
         f"Pistas: {len(project.tracks)}",
     ]
+    if project.markers:
+        lines.insert(3, f"Marcadores: {len(project.markers)}")
     for track in project.tracks:
         details = [_KIND_LABELS[track.kind]]
         if track.audio_clips:
@@ -199,6 +279,21 @@ def summary(project: Project) -> str:
 
 def _count(n: int, singular: str, plural: str) -> str:
     return f"{n} {singular if n == 1 else plural}"
+
+
+def devices_table(project: Project) -> str:
+    """Efectos e instrumentos de cada pista, para rehacerlos en el otro DAW."""
+    rows = [(t.name, t.devices) for t in project.tracks if t.devices]
+    if project.master_devices:
+        rows.append(("Master", project.master_devices))
+    if not rows:
+        return ""
+    lines = [
+        "Efectos e instrumentos (no se convierten: rehazlos en el otro DAW)",
+        "------------------------------------------------------------------",
+    ]
+    lines.extend(f"{name}: {' → '.join(devices)}" for name, devices in rows)
+    return "\n".join(lines)
 
 
 def mix_table(project: Project) -> str:
@@ -250,8 +345,8 @@ def build_report(result: Result) -> str:
         parts.append("Avisos:")
         parts.extend(f"  - {w}" for w in result.project.warnings)
         parts.append("")
-    mix = mix_table(result.project)
-    if mix:
-        parts.extend([mix, ""])
+    for table in (mix_table(result.project), devices_table(result.project)):
+        if table:
+            parts.extend([table, ""])
     parts.append(IMPORT_HELP)
     return "\n".join(parts)

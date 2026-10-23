@@ -1,0 +1,22 @@
+# Cambios
+
+## 0.2.0
+
+- Marcadores (locators) de Ableton en el MIDI: Logic los importa como marcadores.
+- El informe lista los efectos e instrumentos de cada pista y del master, para
+  rehacerlos en el otro DAW.
+- Fundidos de los clips: aplicados en los WAV por pista y declarados en el AAF.
+- Envolventes de los clips MIDI (pitch bend, presión, controladores) en el MIDI.
+- Aviso de notas con probabilidad o variación de velocidad (Live 11/12).
+- Opciones: frecuencia de muestreo, omitir pistas silenciadas y nombre del
+  grupo delante del de cada pista.
+- Barra de progreso, conversión de varias sesiones a la vez y apertura de
+  sesiones soltándolas sobre el icono del Dock o con «Abrir con».
+- Versiones publicadas en GitHub Releases.
+
+## 0.1.0
+
+- Ableton Live a AAF (con audio procesado como en Ableton: warp, bucles,
+  transposición), MIDI y un WAV por pista, con informe e instrucciones para Logic.
+- Pro Tools (AAF + MIDI) a Ableton Live.
+- Aplicación para Mac con chip Apple.

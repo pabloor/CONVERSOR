@@ -24,6 +24,8 @@ from ..model import (
     AudioSegment,
     Automation,
     AutomationPoint,
+    ControllerEvent,
+    Marker,
     MidiClip,
     Note,
     Project,
@@ -68,9 +70,13 @@ def read(path: str | Path) -> Project:
     if master is None:
         master = liveset.find("MasterTrack")
     reader.read_master(master)
+    project.master_devices = _devices(master)
     tracks = liveset.find("Tracks")
     if tracks is not None:
         reader.read_tracks(tracks)
+    for locator in liveset.iterfind("Locators/Locators/Locator"):
+        project.markers.append(Marker(_float(locator, "Time"), _value(locator, "Name") or ""))
+    project.markers.sort(key=lambda m: m.beat)
     return project
 
 
@@ -186,6 +192,7 @@ class _Reader:
             pan=_float(mixer, "Pan/Manual", 0.0),
             mute=not _bool(mixer, "Speaker/Manual", True),
             solo=_bool(mixer, "SoloSink", False),
+            devices=_devices(element),
         )
 
         envelopes = self._envelopes(element)
@@ -206,8 +213,13 @@ class _Reader:
                 if audio is not None:
                     track.audio_clips.append(audio)
         if kind == TrackKind.MIDI and sequencer is not None:
+            controllers = {
+                target.get("Id"): int(target.tag.split(".")[1])
+                for target in sequencer.findall("MidiControllers/*")
+                if target.tag.startswith("ControllerTargets.") and target.get("Id")
+            }
             for clip in sequencer.iterfind("ClipTimeable/ArrangerAutomation/Events/MidiClip"):
-                midi = self._midi_clip(clip)
+                midi = self._midi_clip(clip, controllers, track.name)
                 if midi is not None:
                     track.midi_clips.append(midi)
         if kind in (TrackKind.GROUP, TrackKind.RETURN):
@@ -315,13 +327,17 @@ class _Reader:
             shown = file.name if file else "desconocido"
             self.project.warn(f"No se encuentra el archivo de audio '{shown}' del clip {label}.")
 
-        fade_in = _float(clip, "Fades/FadeInLength")
-        fade_out = _float(clip, "Fades/FadeOutLength")
-        if fade_in > 0.01 or fade_out > 0.01:
-            self.project.warn(
-                f"El clip {label} tiene fundidos; los formatos de intercambio no los "
-                "conservan y hay que rehacerlos en el otro DAW."
-            )
+        # Fundidos: en tiempos del clip si tiene warp y en segundos si no (como
+        # el resto de posiciones del contenido).
+        fade_in = max(_float(clip, "Fades/FadeInLength"), 0.0)
+        fade_out = max(_float(clip, "Fades/FadeOutLength"), 0.0)
+        if not warped:
+            first = self.project.beats_to_seconds(start)
+            last = self.project.beats_to_seconds(end)
+            fade_in = self.project.seconds_to_beats(first + fade_in) - start
+            fade_out = end - self.project.seconds_to_beats(max(last - fade_out, 0.0))
+        fade_in = min(fade_in, end - start)
+        fade_out = min(fade_out, end - start - fade_in)
 
         return AudioClip(
             name=name or (file.stem if file else track_name),
@@ -334,6 +350,8 @@ class _Reader:
             transpose=0.0 if repitch else transpose,
             repitch=repitch,
             warp_mode=warp_mode if warped else None,
+            fade_in=fade_in,
+            fade_out=fade_out,
         )
 
     def _resolve_file(self, file_ref: ET.Element | None) -> Path | None:
@@ -363,7 +381,7 @@ class _Reader:
                 return found
         return candidates[0] if candidates else None
 
-    def _midi_clip(self, clip: ET.Element) -> MidiClip | None:
+    def _midi_clip(self, clip: ET.Element, controllers: dict[str, int], track_name: str) -> MidiClip | None:
         name = _value(clip, "Name") or ""
         if _bool(clip, "Disabled"):
             self.project.warn(f"El clip MIDI '{name}' está desactivado en Ableton; no se exporta.")
@@ -376,11 +394,14 @@ class _Reader:
         looped = _bool(clip, "Loop/LoopOn")
 
         source: list[Note] = []
+        random_notes = 0
         for key_track in clip.iterfind("Notes/KeyTracks/KeyTrack"):
             pitch = int(_float(key_track, "MidiKey", 60))
             for event in key_track.iterfind("Notes/MidiNoteEvent"):
                 if event.get("IsEnabled", "true") != "true":
                     continue
+                if float(event.get("Probability", "1")) < 1 or float(event.get("VelocityDeviation", "0")) != 0:
+                    random_notes += 1
                 source.append(
                     Note(
                         pitch=pitch,
@@ -401,7 +422,112 @@ class _Reader:
                     duration = min(note.duration, seg_end - note.start)
                     notes.append(Note(note.pitch, timeline_pos + note.start - seg_start, duration, note.velocity))
         notes.sort(key=lambda n: (n.start, n.pitch))
-        return MidiClip(name=name, start=start, length=length, notes=notes)
+        if random_notes:
+            self.project.warn(
+                f"El clip MIDI '{name or track_name}' (pista '{track_name}') tiene "
+                f"{random_notes} notas con probabilidad o variación de velocidad: se exportan "
+                "todas, con su velocidad base, y suenan siempre."
+            )
+        events = self._clip_controllers(clip, controllers, segments, length)
+        return MidiClip(name=name, start=start, length=length, notes=notes, controllers=events)
+
+    def _clip_controllers(self, clip, controllers, segments, length) -> list[ControllerEvent]:
+        """Envolventes de controladores MIDI del clip (pitch bend, presión, CC).
+
+        Los destinos de las envolventes son los ControllerTargets.N de la pista:
+        0 es pitch bend, 1 es presión de canal (aftertouch) y 2 + n es el CC n.
+        Las envolventes se repiten con el bucle del clip, como las notas.
+        """
+        result: list[ControllerEvent] = []
+        for envelope in clip.iterfind("Envelopes/Envelopes/ClipEnvelope"):
+            index = controllers.get(_value(envelope, "EnvelopeTarget/PointeeId"))
+            if index is None:
+                continue
+            if index == 0:
+                kind, number, low, high = "pitchbend", 0, -8192, 8191
+            elif index == 1:
+                kind, number, low, high = "aftertouch", 0, 0, 127
+            else:
+                kind, number, low, high = "cc", index - 2, 0, 127
+            points = sorted(
+                (float(e.get("Time", "0")), float(e.get("Value", "0")))
+                for e in envelope.iterfind("Automation/Events/*")
+                if e.get("Value") is not None
+            )
+            if not points:
+                continue
+            for seg_start, seg_end, timeline_pos in segments:
+                for beat, value in _sample_envelope(points, seg_start, seg_end):
+                    event_value = int(round(max(low, min(high, value))))
+                    if result and result[-1].kind == kind and result[-1].number == number and result[-1].value == event_value:
+                        continue
+                    result.append(ControllerEvent(timeline_pos + beat - seg_start, kind, event_value, number))
+        result.sort(key=lambda e: e.beat)
+        return result
+
+
+def _sample_envelope(points, start, end, step=1 / 32):
+    """Valores de una envolvente (lineal entre puntos) en [start, end), cada `step` tiempos."""
+    def value_at(beat):
+        if beat <= points[0][0]:
+            return points[0][1]
+        for (b0, v0), (b1, v1) in zip(points, points[1:]):
+            if b0 <= beat < b1:
+                return v0 if b1 == b0 else v0 + (v1 - v0) * (beat - b0) / (b1 - b0)
+        return points[-1][1]
+
+    beats = {start} | {b for b, _ in points if start < b < end}
+    for (b0, v0), (b1, v1) in zip(points, points[1:]):
+        if v0 != v1 and b1 > start and b0 < end:
+            beat = max(b0, start)
+            while beat < min(b1, end):
+                beats.add(beat)
+                beat += step
+    return [(beat, value_at(beat)) for beat in sorted(beats) if beat < end]
+
+
+# Nombres que muestra Ableton para los dispositivos cuyo nombre interno es distinto.
+_DEVICE_NAMES = {
+    "Eq8": "EQ Eight", "FilterEQ3": "EQ Three", "Compressor2": "Compressor",
+    "GlueCompressor": "Glue Compressor", "MultibandDynamics": "Multiband Dynamics",
+    "StereoGain": "Utility", "AutoFilter": "Auto Filter", "AutoPan": "Auto Pan",
+    "Chorus2": "Chorus-Ensemble", "PhaserNew": "Phaser-Flanger", "Redux2": "Redux",
+    "Hybrid": "Hybrid Reverb", "PingPongDelay": "Ping Pong Delay", "FilterDelay": "Filter Delay",
+    "GrainDelay": "Grain Delay", "BeatRepeat": "Beat Repeat", "DrumBuss": "Drum Buss",
+    "FrequencyShifter": "Frequency Shifter", "OriginalSimpler": "Simpler",
+    "MultiSampler": "Sampler", "InstrumentVector": "Wavetable", "UltraAnalog": "Analog",
+    "InstrumentImpulse": "Impulse", "LoungeLizard": "Electric", "StringStudio": "Tension",
+    "DrumGroupDevice": "Drum Rack", "InstrumentGroupDevice": "Instrument Rack",
+    "AudioEffectGroupDevice": "Audio Effect Rack", "MidiEffectGroupDevice": "MIDI Effect Rack",
+    "MidiArpeggiator": "Arpeggiator", "MidiChord": "Chord", "MidiScale": "Scale",
+    "MidiNoteLength": "Note Length", "MidiPitcher": "Pitch", "MidiRandom": "Random",
+    "MidiVelocity": "Velocity", "MxDeviceAudioEffect": "Max for Live (efecto)",
+    "MxDeviceInstrument": "Max for Live (instrumento)", "MxDeviceMidiEffect": "Max for Live (MIDI)",
+}
+
+
+def _devices(track: ET.Element | None) -> list[str]:
+    """Nombres de los dispositivos de una pista, con el fabricante para los plugins."""
+    if track is None:
+        return []
+    names = []
+    for device in track.findall("DeviceChain/DeviceChain/Devices/*"):
+        user_name = _value(device, "UserName") or ""
+        if device.tag in ("PluginDevice", "AuPluginDevice"):
+            info = device.find("PluginDesc/*")
+            plugin = _value(info, "PlugName") or _value(info, "Name") or "plugin"
+            kind = {"VstPluginInfo": "VST", "Vst3PluginInfo": "VST3", "AuPluginInfo": "AU"}.get(
+                info.tag if info is not None else "", "plugin"
+            )
+            name = f"{plugin} ({kind})"
+        else:
+            name = _DEVICE_NAMES.get(device.tag, device.tag)
+        if user_name and user_name != name:
+            name = f"{user_name} [{name}]"
+        if not _bool(device, "On/Manual", True):
+            name += " (desactivado)"
+        names.append(name)
+    return names
 
 
 def _loop_pieces(total, content_start, loop_start, loop_end, looped, speed=1.0):

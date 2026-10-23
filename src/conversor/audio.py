@@ -55,6 +55,8 @@ class Region:
     file: Path
     offset: float  # segundos dentro del archivo
     gain_db: float = 0.0
+    fade_in: float = 0.0  # segundos
+    fade_out: float = 0.0
 
 
 @dataclass
@@ -64,14 +66,18 @@ class PreparedAudio:
     rendered: int = 0
 
 
-def prepare(project: Project, workdir: Path, rate: int | None = None) -> PreparedAudio:
-    return _Preparer(project, Path(workdir), rate).run()
+def prepare(project: Project, workdir: Path, rate: int | None = None, progress=None) -> PreparedAudio:
+    """Prepara el audio de todas las pistas. `progress(fracción, texto)` informa del avance."""
+    return _Preparer(project, Path(workdir), rate, progress).run()
 
 
 class _Preparer:
-    def __init__(self, project: Project, workdir: Path, rate: int | None):
+    def __init__(self, project: Project, workdir: Path, rate: int | None, progress=None):
         self.project = project
         self.workdir = workdir
+        self.progress = progress
+        self.done = 0
+        self.total = sum(len(t.audio_clips) for t in project.tracks if t.kind == TrackKind.AUDIO)
         self.infos: dict[Path, sf._SoundFileInfo] = {}
         self.ready_files: dict[Path, Path] = {}
         self.used_names: set[str] = set()
@@ -99,16 +105,21 @@ class _Preparer:
                 if clip.file not in self.infos:
                     continue
                 if self._is_natural(clip):
-                    regions.extend(self._natural_regions(clip))
+                    clip_regions = self._natural_regions(clip)
                 elif pylibrb is None and not clip.repitch:
                     self.project.warn(
                         f"No está instalado Rubber Band (pylibrb): el clip '{clip.name}' "
                         "se exporta sin estirar ni transponer."
                     )
-                    regions.extend(self._natural_regions(clip))
+                    clip_regions = self._natural_regions(clip)
                 else:
-                    regions.append(self._rendered_region(track, clip))
+                    clip_regions = [self._rendered_region(track, clip)]
                     result.rendered += 1
+                self._apply_fades(clip, clip_regions)
+                regions.extend(clip_regions)
+                self.done += 1
+                if self.progress:
+                    self.progress(self.done / max(self.total, 1), f"Audio: {track.name} – {clip.name}")
             result.tracks.append((track, regions))
         if any(info.format == "MP3" for info in self.infos.values()):
             self.project.warn(
@@ -118,6 +129,16 @@ class _Preparer:
         return result
 
     # --- Clips que suenan a velocidad original ---
+
+    def _apply_fades(self, clip: AudioClip, regions: list[Region]) -> None:
+        """El fundido de entrada va en la primera región del clip y el de salida en la última."""
+        if not regions:
+            return
+        start, end = clip.start, clip.start + clip.length
+        fade_in = self.seconds(start + clip.fade_in) - self.seconds(start)
+        fade_out = self.seconds(end) - self.seconds(end - clip.fade_out)
+        regions[0].fade_in = min(fade_in, regions[0].length)
+        regions[-1].fade_out = min(fade_out, regions[-1].length - (regions[-1].fade_in if len(regions) == 1 else 0))
 
     def _is_natural(self, clip: AudioClip) -> bool:
         if clip.transpose:
@@ -235,6 +256,15 @@ class _Preparer:
         return self.workdir / f"{candidate}.wav"
 
 
+def _fade(audio: np.ndarray, fade_in: int, fade_out: int) -> None:
+    """Aplica fundidos lineales (en amplitud) al principio y al final."""
+    fade_in, fade_out = min(fade_in, len(audio)), min(fade_out, len(audio))
+    if fade_in > 0:
+        audio[:fade_in] *= np.linspace(0, 1, fade_in, endpoint=False, dtype=np.float32)[:, None]
+    if fade_out > 0:
+        audio[len(audio) - fade_out :] *= np.linspace(1, 0, fade_out, dtype=np.float32)[:, None]
+
+
 def _runs(segments: list[AudioSegment]) -> list[list[AudioSegment]]:
     """Agrupa tramos consecutivos que leen el archivo sin saltos."""
     runs: list[list[AudioSegment]] = []
@@ -346,7 +376,7 @@ def _rubberband(source: np.ndarray, n_out: int, ratio: float, pitch: float, warp
     return _fit(result.astype(np.float32), n_out)
 
 
-def write_stems(prepared: PreparedAudio, folder: Path) -> list[Path]:
+def write_stems(prepared: PreparedAudio, folder: Path, progress=None) -> list[Path]:
     """Escribe un WAV por pista de audio que empieza en el inicio de la sesión.
 
     Incluye la ganancia de cada clip, pero no el volumen ni el panorama de la
@@ -357,6 +387,8 @@ def write_stems(prepared: PreparedAudio, folder: Path) -> list[Path]:
     written = []
     used: set[str] = set()
     for number, (track, regions) in enumerate(prepared.tracks, start=1):
+        if progress:
+            progress((number - 1) / max(len(prepared.tracks), 1), f"Pistas en WAV: {track.name}")
         if not regions:
             continue
         rate = prepared.rate
@@ -372,6 +404,7 @@ def write_stems(prepared: PreparedAudio, folder: Path) -> list[Path]:
             if audio.shape[1] < channels:
                 audio = np.repeat(audio[:, :1], channels, axis=1)
             audio = audio[:, :channels] * np.float32(10 ** (region.gain_db / 20))
+            _fade(audio, round(region.fade_in * rate), round(region.fade_out * rate))
             end = min(start + len(audio), total)
             # Como en el AAF, un clip posterior tapa al anterior si se solapan.
             mix[start:end] = audio[: end - start]

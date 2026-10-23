@@ -15,8 +15,9 @@ def test_convert_generates_aaf_midi_and_report(als_session, tmp_path):
     assert "Avisos:" in report
     assert "Cómo abrirlo en Logic Pro" in report
     # Tabla de mezcla: volumen y panorama de cada pista.
-    assert "Bombo  audio   -6.0 dB   50L  con automatización" in report
-    assert "Bajo   MIDI    +0.0 dB     C  silenciada" in report
+    # El nombre del grupo va delante del de la pista.
+    assert "Batería - Bombo  audio   -6.0 dB   50L  con automatización" in report
+    assert "Bajo             MIDI    +0.0 dB     C  silenciada" in report
 
 
 def test_stems_start_at_session_start(als_session, tmp_path):
@@ -25,7 +26,7 @@ def test_stems_start_at_session_start(als_session, tmp_path):
 
     convert(als_session, tmp_path, targets=("stems",))
     (stem,) = (tmp_path / "Demo - pistas").iterdir()
-    assert stem.name == "01 Bombo.wav"
+    assert stem.name == "01 Batería - Bombo.wav"
     audio, rate = sf.read(stem, always_2d=True)
     assert rate == 48000 and len(audio) == 7 * rate
     level = np.abs(audio[:, 0]) > 0.01
@@ -41,7 +42,7 @@ def test_aaf_places_clips_on_timeline(als_session, tmp_path):
         timecode, slot = list(composition.slots)
         # Empieza en 01:00:00:00, el inicio por defecto de Logic y Pro Tools.
         assert (timecode.segment.fps, timecode.segment.start) == (25, 90000)
-        assert slot.name == "Bombo"
+        assert slot.name == "Batería - Bombo"
         assert slot.edit_rate == 48000
         # Panorama y volumen de la pista envuelven la secuencia de clips.
         pan = slot.segment

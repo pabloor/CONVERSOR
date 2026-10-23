@@ -102,6 +102,16 @@ def run(with_gui: bool = True) -> list[str]:
         if not any(p.suffix == ".als" for p in back.outputs):
             problems.append("no se ha generado el set de Ableton")
 
+    # Conexión segura con GitHub (para las actualizaciones). En la aplicación
+    # empaquetada fallaba porque su Python no encontraba los certificados.
+    if "--sin-red" not in sys.argv:
+        from . import update
+
+        try:
+            update.check_connection()
+        except OSError as error:
+            problems.append(f"no se puede conectar con GitHub de forma segura: {error}")
+
     if with_gui:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtWidgets import QApplication

@@ -1,5 +1,12 @@
 # Cambios
 
+## 0.4.1
+
+- Corrige el error «CERTIFICATE_VERIFY_FAILED» al buscar actualizaciones: la
+  aplicación usa ahora los certificados de macOS para conectar con GitHub.
+- La autoprueba de cada versión comprueba la conexión con GitHub desde la
+  aplicación ya empaquetada.
+
 ## 0.4.0
 
 - Sonido con efectos: además del `.als`, se puede indicar la carpeta con las

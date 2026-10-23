@@ -1,3 +1,3 @@
 """Conversor de sesiones entre DAWs."""
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"

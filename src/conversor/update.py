@@ -20,9 +20,11 @@ import os
 import plistlib
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +44,37 @@ class UpdateError(Exception):
     pass
 
 
+def _ssl_context() -> ssl.SSLContext:
+    """Certificados con los que comprobar la conexión con GitHub.
+
+    El Python incluido en la aplicación no ve los certificados de macOS, así
+    que se usan los del sistema mediante truststore (como Safari, también
+    detrás de un proxy de empresa) y, si no está disponible, los de certifi.
+    """
+    try:
+        import truststore
+
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except Exception:  # noqa: BLE001 - se recurre a certifi
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+
+
+def urlopen(request, timeout):
+    return urllib.request.urlopen(request, timeout=timeout, context=_ssl_context())
+
+
+def check_connection() -> None:
+    """Comprueba que se puede abrir una conexión segura con GitHub (para la autoprueba)."""
+    request = urllib.request.Request("https://api.github.com/", headers={"User-Agent": f"Conversor/{__version__}"})
+    try:
+        with urlopen(request, timeout=_TIMEOUT):
+            pass
+    except urllib.error.HTTPError:
+        pass  # GitHub ha respondido (p. ej. límite de consultas): la conexión segura funciona.
+
+
 @dataclass
 class Update:
     version: str
@@ -57,7 +90,7 @@ def parse_version(text: str) -> tuple[int, ...]:
     return tuple(int(n) for n in numbers[:3]) if numbers else (0,)
 
 
-def check(current: str = __version__, opener=urllib.request.urlopen) -> Update | None:
+def check(current: str = __version__, opener=urlopen) -> Update | None:
     """Devuelve la actualización disponible, o None si ya está la última versión."""
     request = urllib.request.Request(
         LATEST_RELEASE,
@@ -88,7 +121,7 @@ def check(current: str = __version__, opener=urllib.request.urlopen) -> Update |
     )
 
 
-def download(update: Update, folder: Path, progress=None, opener=urllib.request.urlopen) -> Path:
+def download(update: Update, folder: Path, progress=None, opener=urlopen) -> Path:
     """Descarga el .dmg y comprueba su SHA-256. `progress(fracción)` informa del avance."""
     target = Path(folder) / ASSET_NAME
     digest = hashlib.sha256()

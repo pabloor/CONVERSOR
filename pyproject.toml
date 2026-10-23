@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "conversor"
-version = "0.4.0"
+version = "0.4.1"
 description = "Conversor de sesiones entre DAWs (Ableton Live, Pro Tools, Logic, Cubase, FL Studio)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,6 +15,9 @@ dependencies = [
     "numpy>=1.24",
     "soundfile>=0.12",
     "soxr>=0.3",
+    # Certificados para conectar con GitHub desde la aplicación empaquetada.
+    "truststore>=0.9",
+    "certifi>=2024.0",
     # Rubber Band, para estirar el audio con warp. No hay versión para Mac con Intel.
     "pylibrb>=0.1; python_version >= '3.12' and (sys_platform != 'darwin' or platform_machine != 'x86_64')",
 ]

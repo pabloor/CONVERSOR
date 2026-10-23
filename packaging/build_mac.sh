@@ -23,6 +23,8 @@ pyinstaller --noconfirm --clean --windowed \
     --collect-all aaf2 \
     --collect-all soundfile \
     --collect-all soxr \
+    --collect-data certifi \
+    --collect-submodules truststore \
     "${extra[@]}" \
     packaging/conversor_app.py
 

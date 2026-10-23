@@ -25,6 +25,35 @@ Opciones (en la aplicación y en la línea de comandos):
 
 Se pueden convertir varias sesiones a la vez: cada una va a su propia carpeta.
 
+#### Sonido con efectos
+
+El `.als` guarda qué efectos e instrumentos hay, pero no el sonido que
+producen, y los dispositivos de Ableton solo funcionan dentro de Ableton. Para
+llevar el sonido con todos sus efectos:
+
+1. En Ableton: *Archivo > Exportar audio/vídeo*, «Pistas renderizadas: Todas
+   las pistas individuales», empezando en el compás 1. No modifica la sesión.
+2. En el conversor, elige esa carpeta en «Sonido con efectos» (o
+   `--renderizadas CARPETA`).
+
+Resultado en el AAF y en los WAV por pista:
+
+- Cada pista de audio, **procesada** y cortada en los mismos clips que en
+  Ableton, con las colas de reverb y delay hasta el siguiente clip. Va a 0 dB y
+  al centro, porque la exportación de Ableton ya incluye su volumen y panorama.
+- Debajo, su versión **limpia** con el volumen al mínimo, por si quieres rehacer
+  la mezcla (`--sin-limpias` para no incluirla).
+- Cada pista MIDI, también como audio («Synth (audio)») con el sonido de su
+  instrumento; sus notas siguen en el `.mid`.
+- Los retornos, como pistas propias.
+- El master y los grupos, solo como referencia en la carpeta `referencias`:
+  ya contienen el audio de sus pistas y sonarían dos veces. Los efectos de un
+  grupo no están en las pistas procesadas de sus miembros (el informe lo avisa).
+
+Cada archivo exportado se relaciona con su pista por el nombre; el informe
+indica los que no encajan. Si la exportación no empieza en el compás 1, indícalo
+en «La exportación empieza en el compás» (`--inicio-render`).
+
 Pro Tools, Logic y Cubase guardan sus sesiones en formatos cerrados que no se
 pueden escribir directamente. AAF y MIDI son los formatos de intercambio que
 todos ellos importan.
@@ -92,9 +121,11 @@ etc.
 ### Limitaciones conocidas
 
 - Ableton: solo se leen los clips del arreglo (Arrangement), no los de la vista Session.
-- No se convierten los efectos y los instrumentos (plugins). Para llevar el
-  sonido de una pista MIDI o con efectos, usa en Ableton «Congelar y aplanar»
-  (Freeze and Flatten) antes de convertir.
+- Sin la carpeta de pistas exportadas, el audio sale sin efectos y las pistas
+  MIDI solo como notas (ver «Sonido con efectos»).
+- Con las pistas exportadas, se supone que la exportación individual de
+  Ableton incluye el volumen y el panorama de cada pista; falta confirmarlo con
+  una sesión real.
 - No se convierten las envolventes de los clips de audio (volumen, transposición
   dentro del clip).
 - Los grupos y los retornos no se convierten, y el solo de las pistas tampoco.
@@ -176,6 +207,7 @@ Línea de comandos:
 conversor "Mi canción.als" -o salida/
 conversor "Mi canción.als" --formato midi
 conversor *.als --frecuencia 48000 --omitir-silenciadas   # varias sesiones
+conversor "Mi canción.als" --renderizadas "Mi canción exportada/"   # con efectos
 conversor Cancion.aaf Cancion.mid                # Pro Tools -> Ableton
 conversor Cancion.aaf --tempo 92 --plantilla "Vacío.als"
 ```

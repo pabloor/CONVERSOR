@@ -1,5 +1,17 @@
 # Cambios
 
+## 0.4.0
+
+- Sonido con efectos: además del `.als`, se puede indicar la carpeta con las
+  pistas exportadas desde Ableton («Todas las pistas individuales»). Cada
+  pista llega a Logic procesada, con todos sus efectos e instrumentos, cortada
+  en los mismos clips que en Ableton y con las colas de reverb y delay hasta
+  el siguiente clip.
+- Debajo de cada pista procesada va su versión limpia, con el volumen al
+  mínimo (se puede desactivar).
+- Las pistas MIDI llegan también como audio con el sonido de su instrumento;
+  los retornos, como pistas propias; el master y los grupos, como referencia.
+
 ## 0.3.0
 
 - Actualizaciones automáticas: al abrirse, la aplicación comprueba si hay una

@@ -6,6 +6,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import rendered as rendered_tracks
 from .audio import prepare, write_stems
 from .formats import aaf, ableton, midi
 from .model import Project, TempoPoint, TrackKind
@@ -62,6 +63,7 @@ class Result:
     project: Project
     outputs: list[Path] = field(default_factory=list)
     rendered_clips: int = 0
+    rendered_set: rendered_tracks.RenderedSet | None = None
 
 
 def supported_extensions() -> list[str]:
@@ -123,6 +125,9 @@ def convert(
     sample_rate: int | None = None,
     skip_muted: bool = False,
     group_prefix: bool = True,
+    rendered: str | Path | None = None,
+    keep_clean: bool = True,
+    render_start_bar: float = 1,
     progress=None,
 ) -> Result:
     """Convierte una sesión.
@@ -130,6 +135,10 @@ def convert(
     - sample_rate: frecuencia del audio exportado (por defecto, la más habitual en la sesión).
     - skip_muted: no exportar las pistas silenciadas.
     - group_prefix: anteponer el nombre del grupo al de cada pista ("Batería - Bombo").
+    - rendered: carpeta con las pistas exportadas desde Ableton (todas las pistas
+      individuales), para llevar el sonido con sus efectos. keep_clean mantiene
+      además la versión limpia de cada pista de audio, con el volumen al mínimo;
+      render_start_bar es el compás en el que empieza la exportación.
     - progress(fracción, texto): informa del avance.
     """
     report_progress = progress or (lambda fraction, text: None)
@@ -137,11 +146,17 @@ def convert(
     targets = targets or default_targets(paths)
     report_progress(0.0, "Leyendo la sesión")
     project = load(paths, tempo)
+    rendered_set = None
+    if rendered and _from_ableton(paths):
+        # Antes de cambiar los nombres: los archivos llevan el nombre original de cada pista.
+        rendered_set = rendered_tracks.match(Path(rendered), project)
+        start_beat = _bar_to_beat(project, render_start_bar)
+        rendered_tracks.apply(project, rendered_set, keep_clean, start_beat)
     if _from_ableton(paths):
         _apply_options(project, skip_muted, group_prefix)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    result = Result(project)
+    result = Result(project, rendered_set=rendered_set)
     name = project.name
 
     has_audio = any(t.kind == TrackKind.AUDIO and t.audio_clips for t in project.tracks)
@@ -159,11 +174,19 @@ def convert(
                 folder = output_dir / f"{name} - pistas"
                 write_stems(prepared, folder, _stage(report_progress, 0.85, 0.95))
                 result.outputs.append(folder)
-    if "aaf" in targets and has_midi and _from_ableton(paths):
+    midi_without_audio = [
+        t for t in project.tracks
+        if t.kind == TrackKind.MIDI and not any(o.name == t.name + rendered_tracks.AUDIO_SUFFIX for o in project.tracks)
+    ]
+    if rendered_set is not None and rendered_set.references:
+        folder = output_dir / f"{name} - referencias"
+        rendered_tracks.copy_references(rendered_set, folder)
+        result.outputs.append(folder)
+    if "aaf" in targets and midi_without_audio and _from_ableton(paths):
         project.warn(
             "Las pistas MIDI se exportan como notas, sin el sonido de sus instrumentos. "
-            "Para llevar también su audio, en Ableton usa «Congelar y aplanar» "
-            "(Freeze and Flatten) en esas pistas antes de convertir."
+            "Para llevar también su audio con todos sus efectos, exporta en Ableton "
+            "«Todas las pistas individuales» y añade esa carpeta al convertir."
         )
     report_progress(0.95, "Escribiendo MIDI e informe")
     if "midi" in targets and has_midi:
@@ -201,6 +224,12 @@ def convert_many(sessions, output_root: str | Path | None = None, progress=None,
         except (OSError, ValueError, SyntaxError) as error:
             results.append((session, error))
     return results
+
+
+def _bar_to_beat(project: Project, bar: float) -> float:
+    """Compás (empezando en 1) a tiempos, con el compás inicial de la sesión."""
+    signature = project.time_signatures[0]
+    return (bar - 1) * signature.numerator * 4 / signature.denominator
 
 
 def default_output(session: Path) -> Path:
@@ -296,6 +325,24 @@ def devices_table(project: Project) -> str:
     return "\n".join(lines)
 
 
+def rendered_section(rendered_set) -> str:
+    if rendered_set is None:
+        return ""
+    lines = ["Pistas renderizadas en Ableton (con efectos)", "--------------------------------------------"]
+    for track, file in rendered_set.matched.items():
+        lines.append(f"{track} ← {file.name}")
+    if rendered_set.master:
+        lines.append(f"Master ← {rendered_set.master.name} (solo como referencia)")
+    if rendered_set.unmatched:
+        lines.append("Sin pista correspondiente (no se usan): " + ", ".join(p.name for p in rendered_set.unmatched))
+    if not rendered_set.matched:
+        lines.append(
+            "No se ha reconocido ningún archivo. Exporta desde la sesión con «Todas las pistas "
+            "individuales» sin cambiar los nombres de los archivos."
+        )
+    return "\n".join(lines)
+
+
 def mix_table(project: Project) -> str:
     """Volumen, panorama y estado de cada pista, para comprobarlos o ajustarlos a mano."""
     rows = []
@@ -345,7 +392,7 @@ def build_report(result: Result) -> str:
         parts.append("Avisos:")
         parts.extend(f"  - {w}" for w in result.project.warnings)
         parts.append("")
-    for table in (mix_table(result.project), devices_table(result.project)):
+    for table in (rendered_section(result.rendered_set), mix_table(result.project), devices_table(result.project)):
         if table:
             parts.extend([table, ""])
     parts.append(IMPORT_HELP)

@@ -136,6 +136,33 @@ class MainWindow(QMainWindow):
         export_layout.addRow(self.skip_muted_check)
         export_layout.addRow(self.group_check)
 
+        # Sonido con efectos: pistas exportadas desde Ableton.
+        self.rendered_edit = QLineEdit()
+        self.rendered_edit.setPlaceholderText("Ninguna: el audio se exporta sin efectos")
+        self.rendered_edit.textChanged.connect(self._update_rendered_options)
+        rendered_button = QPushButton("Elegir…")
+        rendered_button.clicked.connect(self.choose_rendered)
+        self.clean_check = QCheckBox("Incluir también las pistas limpias (con el volumen al mínimo)")
+        self.clean_check.setChecked(self.settings.value("keep_clean", "true") == "true")
+        self.render_start_spin = QDoubleSpinBox()
+        self.render_start_spin.setRange(1, 9999)
+        self.render_start_spin.setDecimals(0)
+        self.render_start_spin.setValue(1)
+        self.rendered_box = QGroupBox("Sonido con efectos (opcional)")
+        rendered_layout = QFormLayout(self.rendered_box)
+        hint = QLabel(
+            "En Ableton: Archivo > Exportar audio/vídeo > Pistas renderizadas: «Todas las pistas "
+            "individuales», empezando en el compás 1. Elige aquí esa carpeta."
+        )
+        hint.setWordWrap(True)
+        rendered_layout.addRow(hint)
+        rendered_row = QHBoxLayout()
+        rendered_row.addWidget(self.rendered_edit)
+        rendered_row.addWidget(rendered_button)
+        rendered_layout.addRow("Pistas exportadas:", rendered_row)
+        rendered_layout.addRow("La exportación empieza en el compás:", self.render_start_spin)
+        rendered_layout.addRow(self.clean_check)
+
         # Opciones para crear un set de Ableton desde Pro Tools.
         self.tempo_spin = QDoubleSpinBox()
         self.tempo_spin.setRange(0, 999)
@@ -200,6 +227,7 @@ class MainWindow(QMainWindow):
         options.addWidget(targets_box)
         options.addWidget(self.export_box, 1)
         layout.addLayout(options)
+        layout.addWidget(self.rendered_box)
         layout.addWidget(self.reverse_box)
         layout.addWidget(self.progress_bar)
         layout.addLayout(buttons)
@@ -348,6 +376,17 @@ class MainWindow(QMainWindow):
         if directory:
             self.output_edit.setText(directory)
 
+    def choose_rendered(self) -> None:
+        start = self.rendered_edit.text() or (str(self.sources[0].parent) if self.sources else self._last_folder())
+        directory = QFileDialog.getExistingDirectory(self, "Carpeta con las pistas exportadas de Ableton", start)
+        if directory:
+            self.rendered_edit.setText(directory)
+
+    def _update_rendered_options(self) -> None:
+        on = bool(self.rendered_edit.text().strip())
+        self.clean_check.setEnabled(on)
+        self.render_start_spin.setEnabled(on)
+
     def choose_template(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(self, "Set vacío de Ableton", self._last_folder(), "Sets de Ableton (*.als)")
         self.template_edit.setText(filename)
@@ -356,6 +395,9 @@ class MainWindow(QMainWindow):
         return len(self.sources) > 1 and all(p.suffix.lower() == ".als" for p in self.sources)
 
     def set_sources(self, paths: list[Path]) -> None:
+        if paths != self.sources:
+            # La exportación de otra sesión no sirve para esta.
+            self.rendered_edit.clear()
         self.sources = paths
         self.settings.setValue("last_folder", str(paths[0].parent))
         if self.is_batch():
@@ -375,7 +417,10 @@ class MainWindow(QMainWindow):
             check.setEnabled(bool(self.sources) and (name != "ableton") == from_ableton)
             check.setChecked(name in defaults)
         self.export_box.setEnabled(bool(self.sources) and from_ableton)
+        self.rendered_box.setVisible(not self.sources or from_ableton)
+        self.rendered_box.setEnabled(bool(self.sources) and from_ableton and not self.is_batch())
         self.reverse_box.setVisible(bool(self.sources) and not from_ableton)
+        self._update_rendered_options()
 
     def _tempo(self) -> float | None:
         return self.tempo_spin.value() or None
@@ -408,6 +453,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("rate_index", self.rate_combo.currentIndex())
         self.settings.setValue("skip_muted", "true" if self.skip_muted_check.isChecked() else "false")
         self.settings.setValue("group_prefix", "true" if self.group_check.isChecked() else "false")
+        self.settings.setValue("keep_clean", "true" if self.clean_check.isChecked() else "false")
         return dict(
             targets=targets,
             template=self.template_edit.text() or None,
@@ -434,7 +480,13 @@ class MainWindow(QMainWindow):
         else:
             output = Path(output_text) if output_text else default_output(sources[0])
             self._output_dir = output
-            job = lambda progress: convert(sources, output, progress=progress, **options)  # noqa: E731
+            rendered = self.rendered_edit.text().strip() or None
+            extra = dict(
+                rendered=rendered,
+                keep_clean=self.clean_check.isChecked(),
+                render_start_bar=self.render_start_spin.value(),
+            )
+            job = lambda progress: convert(sources, output, progress=progress, **options, **extra)  # noqa: E731
 
         self.convert_button.setEnabled(False)
         self.show_button.setEnabled(False)

@@ -11,6 +11,8 @@ from PySide6.QtCore import QSettings  # noqa: E402
 from PySide6.QtGui import QFileOpenEvent  # noqa: E402
 
 from conversor.gui import Application, MainWindow  # noqa: E402
+from test_rendered import renders  # noqa: E402,F401 - fixture
+from test_session_details import session  # noqa: E402,F401 - fixture
 
 
 @pytest.fixture(scope="module")
@@ -67,3 +69,18 @@ def test_files_dropped_on_dock_icon(app, window, als_session):
     app.event(QFileOpenEvent(str(als_session)))
     app.event(QFileOpenEvent(str(als_session.with_suffix(".txt"))))  # se ignora
     wait(app, lambda: window.sources == [als_session], timeout=5)
+
+
+def test_converts_with_rendered_tracks(app, window, session, renders):
+    window.set_sources([session])
+    assert window.rendered_box.isEnabled() and not window.clean_check.isEnabled()
+    window.rendered_edit.setText(str(renders))
+    assert window.clean_check.isEnabled()
+    window.start_conversion()
+    wait(app, lambda: window.show_button.isEnabled())
+    output = session.parent / "Detalles (convertido)"
+    assert (output / "Detalles - referencias").is_dir()
+    assert "Caja ← Detalles Caja.wav" in window.log.toPlainText()
+    # Otra sesión: la carpeta de exportación ya no vale.
+    window.set_sources([session.with_name("Otra.als")])
+    assert window.rendered_edit.text() == ""

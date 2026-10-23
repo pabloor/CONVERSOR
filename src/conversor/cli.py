@@ -32,6 +32,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--frecuencia", type=int, help="frecuencia de muestreo del audio exportado (p. ej. 44100 o 48000)")
     parser.add_argument("--omitir-silenciadas", action="store_true", help="no exportar las pistas silenciadas")
     parser.add_argument("--sin-grupo", action="store_true", help="no anteponer el nombre del grupo al de cada pista")
+    parser.add_argument(
+        "--renderizadas", type=Path, metavar="CARPETA",
+        help="carpeta con las pistas exportadas desde Ableton (Exportar audio > todas las pistas "
+        "individuales), para llevar el sonido con sus efectos",
+    )
+    parser.add_argument("--sin-limpias", action="store_true", help="con --renderizadas, no incluir las versiones limpias")
+    parser.add_argument("--inicio-render", type=float, default=1, metavar="COMPÁS",
+                        help="compás en el que empieza la exportación de Ableton (por defecto, 1)")
     parser.add_argument("--tempo", type=float, help="tempo en BPM si el origen no lo incluye (AAF sin MIDI)")
     parser.add_argument("--plantilla", type=Path, help="set vacío de Ableton para usar como plantilla")
     args = parser.parse_args(argv)
@@ -46,6 +54,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     sessions = args.sessions
     if len(sessions) > 1 and all(s.suffix.lower() == ".als" for s in sessions):
+        if args.renderizadas:
+            parser.error("--renderizadas solo se puede usar con una sesión")
         failed = 0
         for session, result in convert_many(sessions, args.output, **options):
             if isinstance(result, Exception):
@@ -58,7 +68,10 @@ def main(argv: list[str] | None = None) -> int:
 
     output = args.output or default_output(sessions[0])
     try:
-        result = convert(sessions, output, **options)
+        result = convert(
+            sessions, output, rendered=args.renderizadas, keep_clean=not args.sin_limpias,
+            render_start_bar=args.inicio_render, **options,
+        )
     except (OSError, ValueError, SyntaxError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1

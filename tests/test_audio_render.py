@@ -226,7 +226,7 @@ def test_aaf_contains_rendered_audio_and_clip_gain(tmp_path):
     convert(path, tmp_path / "out", targets=("aaf",))
     with aaf2.open(str(tmp_path / "out" / "Set.aaf"), "r") as f:
         (composition,) = list(f.content.toplevel())
-        (slot,) = list(composition.slots)
+        _, slot = list(composition.slots)
         (group,) = list(slot.segment.components)
         assert group.operation.name == "Mono Audio Gain"
         assert float(next(iter(group.parameters)).value) == pytest.approx(0.5)

@@ -1,7 +1,7 @@
 """Lectura y escritura de archivos MIDI estándar (SMF).
 
 Todos los DAW (Pro Tools, Logic, Cubase, FL Studio, Ableton) importan este
-formato con tempo, compás, nombres de pista, notas y controladores.
+formato con tempo, compás, nombres de pista, notas y panorama.
 """
 
 from __future__ import annotations
@@ -29,17 +29,15 @@ def write(project: Project, path: str | Path) -> int:
             continue
         events: list[tuple[int, int, mido.Message]] = []
         # El segundo campo ordena eventos simultáneos: note_off antes que note_on.
-        events.append((0, 0, mido.Message("control_change", control=7, value=_volume_cc(track.volume_db))))
-        events.append((0, 0, mido.Message("control_change", control=10, value=_pan_cc(track.pan))))
-        for automation in track.automation:
-            for point in automation.points:
-                if automation.parameter == "volume":
-                    message = mido.Message("control_change", control=7, value=_volume_cc(point.value))
-                elif automation.parameter == "pan":
-                    message = mido.Message("control_change", control=10, value=_pan_cc(point.value))
-                else:
-                    continue
-                events.append((_ticks(point.beat), 0, message))
+        # Solo el panorama: el volumen (CC7) no se escribe porque Logic no usa la
+        # curva de General MIDI (127 es +6 dB) y las pistas entrarían más fuertes.
+        # Los volúmenes van en el informe.
+        pan = next((a for a in track.automation if a.parameter == "pan"), None)
+        if pan:
+            for point in pan.points:
+                events.append((_ticks(point.beat), 0, mido.Message("control_change", control=10, value=_pan_cc(point.value))))
+        elif abs(track.pan) > 0.001:
+            events.append((0, 0, mido.Message("control_change", control=10, value=_pan_cc(track.pan))))
         for clip in track.midi_clips:
             for note in clip.notes:
                 start = _ticks(clip.start + note.start)
@@ -104,13 +102,6 @@ def _append_sorted(track: mido.MidiTrack, events: list) -> None:
 
 def _ticks(beat: float) -> int:
     return max(0, int(round(beat * TICKS_PER_BEAT)))
-
-
-def _volume_cc(db: float) -> int:
-    # Curva General MIDI: dB = 40 * log10(cc / 127).
-    if db == -math.inf:
-        return 0
-    return max(0, min(127, int(round(127 * 10 ** (db / 40.0)))))
 
 
 def _pan_cc(pan: float) -> int:

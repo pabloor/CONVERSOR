@@ -344,3 +344,42 @@ def _rubberband(source: np.ndarray, n_out: int, ratio: float, pitch: float, warp
         output.append(stretcher.retrieve(available))
     result = np.concatenate(output, axis=1).T if output else np.zeros((0, channels), np.float32)
     return _fit(result.astype(np.float32), n_out)
+
+
+def write_stems(prepared: PreparedAudio, folder: Path) -> list[Path]:
+    """Escribe un WAV por pista de audio que empieza en el inicio de la sesión.
+
+    Incluye la ganancia de cada clip, pero no el volumen ni el panorama de la
+    pista, que se ajustan en el otro DAW. Arrastrados al compás 1, quedan
+    alineados con el resto de la sesión.
+    """
+    folder.mkdir(parents=True, exist_ok=True)
+    written = []
+    used: set[str] = set()
+    for number, (track, regions) in enumerate(prepared.tracks, start=1):
+        if not regions:
+            continue
+        rate = prepared.rate
+        channels = max(sf.info(str(r.file)).channels for r in regions)
+        total = max(round((r.start + r.length) * rate) for r in regions)
+        mix = np.zeros((total, channels), dtype=np.float32)
+        for region in regions:
+            start = round(region.start * rate)
+            offset = round(region.offset * rate)
+            audio, _ = sf.read(
+                str(region.file), start=offset, frames=round(region.length * rate), dtype="float32", always_2d=True
+            )
+            if audio.shape[1] < channels:
+                audio = np.repeat(audio[:, :1], channels, axis=1)
+            audio = audio[:, :channels] * np.float32(10 ** (region.gain_db / 20))
+            end = min(start + len(audio), total)
+            # Como en el AAF, un clip posterior tapa al anterior si se solapan.
+            mix[start:end] = audio[: end - start]
+        name = re.sub(r'[\\/:*?"<>|]+', "_", f"{number:02d} {track.name}").strip()
+        while name.lower() in used:
+            name += " bis"
+        used.add(name.lower())
+        path = folder / f"{name}.wav"
+        sf.write(str(path), np.clip(mix, -1.0, 1.0), rate, subtype="PCM_24", format="WAV")
+        written.append(path)
+    return written

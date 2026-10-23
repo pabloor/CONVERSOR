@@ -11,12 +11,29 @@ Aplicación de escritorio para pasar sesiones de un DAW a otro.
 | Archivo | Contenido | Se abre en |
 |---|---|---|
 | `.aaf` | Pistas de audio con sus clips en su posición, el audio incrustado, el volumen y el panorama de cada pista (con su automatización) y la ganancia de cada clip | Pro Tools, Logic Pro, Cubase/Nuendo |
-| `.mid` | Pistas MIDI con notas, tempo (incluidos los cambios), compás, volumen y panorama | Todos (también FL Studio) |
-| `informe.txt` | Resumen de la sesión, avisos sobre lo que no se ha podido convertir y cómo importar en cada DAW | — |
+| `.mid` | Pistas MIDI con notas, tempo (incluidos los cambios), compás y panorama | Todos (también FL Studio) |
+| `<sesión> - pistas/` | Un WAV por pista de audio que empieza en el inicio de la sesión, con los clips ya colocados y procesados | Todos: se arrastran al compás 1 |
+| `informe.txt` | Resumen de la sesión, avisos sobre lo que no se ha podido convertir, tabla de mezcla (volumen y panorama de cada pista) y cómo importar en cada DAW | — |
 
 Pro Tools, Logic y Cubase guardan sus sesiones en formatos cerrados que no se
 pueden escribir directamente. AAF y MIDI son los formatos de intercambio que
 todos ellos importan.
+
+#### En Logic Pro
+
+1. *Archivo > Abrir* y elige el `.mid`: se crea un proyecto con el tempo, el
+   compás y las pistas MIDI.
+2. *Archivo > Importar > Archivo AAF* y elige el `.aaf`: se añaden las pistas
+   de audio.
+3. Si algo falla con el AAF, arrastra los WAV de la carpeta `pistas` al
+   compás 1 y elige *Crear pistas nuevas*.
+
+El AAF empieza en el código de tiempo 01:00:00:00, que es donde empiezan por
+defecto los proyectos de Logic. El MIDI no incluye el volumen (CC7), porque
+Logic lo interpreta con otra curva y las pistas sonarían más fuertes. Los
+volúmenes están en la tabla de mezcla del informe.
+
+#### Fidelidad del audio
 
 El objetivo es que el audio suene exactamente como en Ableton:
 

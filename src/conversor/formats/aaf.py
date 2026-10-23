@@ -61,6 +61,12 @@ _AMPLITUDE = "e4962320-2267-11d3-8a4c-0050040ef7d2"
 _PAN = "e4962322-2267-11d3-8a4c-0050040ef7d2"
 _LINEAR_INTERP = "5b6c85a4-0ede-11d3-80a9-006008143e6f"
 
+# La línea de tiempo empieza en el código de tiempo 01:00:00:00, el inicio por
+# defecto de los proyectos de Logic y Pro Tools: así el principio de la sesión
+# cae en el compás 1.
+_TIMECODE_FPS = 25
+_TIMECODE_START = 60 * 60 * _TIMECODE_FPS
+
 
 def write(project: Project, path: str | Path, prepared: PreparedAudio | None = None) -> int:
     """Escribe las pistas de audio del proyecto. Devuelve el número de clips escritos.
@@ -78,6 +84,11 @@ def write(project: Project, path: str | Path, prepared: PreparedAudio | None = N
         composition = f.create.CompositionMob(project.name)
         composition.usage = "Usage_TopLevel"
         f.content.mobs.append(composition)
+        timecode_slot = composition.create_timeline_slot(edit_rate=_TIMECODE_FPS)
+        timecode_slot.name = "TC1"
+        timecode = f.create.Timecode(fps=_TIMECODE_FPS, drop=False)
+        timecode.start = _TIMECODE_START
+        timecode_slot.segment = timecode
         master_mobs: dict[Path, tuple[object, int]] = {}
 
         for number, (track, regions) in enumerate(prepared.tracks, start=1):

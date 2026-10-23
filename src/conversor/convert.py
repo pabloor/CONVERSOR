@@ -6,16 +6,17 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .audio import prepare
+from .audio import prepare, write_stems
 from .formats import aaf, ableton, midi
 from .model import Project, TempoPoint, TrackKind
 
 SOURCE_EXTENSIONS = (".aaf", ".als", ".mid", ".midi")
 
-TARGETS = ("aaf", "midi", "ableton")
+TARGETS = ("aaf", "midi", "stems", "ableton")
 TARGET_LABELS = {
-    "aaf": "AAF (Pro Tools, Logic, Cubase)",
-    "midi": "MIDI (todos los DAW)",
+    "aaf": "AAF: pistas de audio con sus clips (Logic, Pro Tools, Cubase)",
+    "midi": "MIDI: notas, tempo y compás (todos los DAW)",
+    "stems": "Un WAV por pista de audio, desde el compás 1",
     "ableton": "Ableton Live (.als)",
 }
 
@@ -28,16 +29,24 @@ _KIND_LABELS = {
 _PARAMETER_LABELS = {"volume": "volumen", "pan": "panorama", "mute": "silencio"}
 
 IMPORT_HELP = """\
-Cómo abrir el resultado en cada DAW
------------------------------------
-Pro Tools:   Archivo > Abrir sesión (o Importar > Datos de sesión) con el .aaf;
+Cómo abrirlo en Logic Pro
+-------------------------
+1. Archivo > Abrir y elige el .mid. Se crea un proyecto con el tempo, el
+   compás y las pistas MIDI (con instrumentos por defecto).
+2. Archivo > Importar > Archivo AAF y elige el .aaf. Se añaden las pistas de
+   audio con sus clips, su volumen y su panorama.
+3. Si el audio no queda en su sitio, usa la carpeta «pistas»: selecciona
+   todos los WAV, arrástralos al compás 1 y elige «Crear pistas nuevas».
+4. Ajusta los volúmenes de las pistas MIDI con la tabla de mezcla de este informe.
+
+Otros DAW
+---------
+Pro Tools:   Archivo > Importar > Datos de sesión con el .aaf;
              Archivo > Importar > MIDI con el .mid.
-Logic Pro:   Archivo > Importar > AAF con el .aaf;
-             Archivo > Importar > Archivo MIDI con el .mid.
 Cubase:      Archivo > Importar > Archivo AAF con el .aaf;
              Archivo > Importar > Archivo MIDI con el .mid.
-FL Studio:   no admite AAF. Importa el .mid (Archivo > Importar > Archivo MIDI)
-             y arrastra los audios a la lista de reproducción.
+FL Studio:   no admite AAF. Importa el .mid y arrastra los WAV de la carpeta
+             «pistas» al inicio de la lista de reproducción.
 Ableton:     abre el .als de la carpeta "<sesión> Project". El audio está en
              Samples/Imported dentro de esa carpeta.
 """
@@ -61,7 +70,7 @@ def supported_extensions() -> list[str]:
 
 def default_targets(sources) -> tuple[str, ...]:
     if any(Path(s).suffix.lower() == ".als" for s in sources):
-        return ("aaf", "midi")
+        return ("aaf", "midi", "stems")
     return ("ableton",)
 
 
@@ -122,13 +131,18 @@ def convert(
     has_audio = any(t.kind == TrackKind.AUDIO and t.audio_clips for t in project.tracks)
     has_midi = any(t.kind == TrackKind.MIDI for t in project.tracks)
 
-    if "aaf" in targets and has_audio:
-        path = output_dir / f"{name}.aaf"
+    if has_audio and ("aaf" in targets or "stems" in targets):
         with tempfile.TemporaryDirectory(prefix="conversor-") as workdir:
             prepared = prepare(project, Path(workdir))
-            aaf.write(project, path, prepared)
-        result.rendered_clips = prepared.rendered
-        result.outputs.append(path)
+            result.rendered_clips = prepared.rendered
+            if "aaf" in targets:
+                path = output_dir / f"{name}.aaf"
+                aaf.write(project, path, prepared)
+                result.outputs.append(path)
+            if "stems" in targets:
+                folder = output_dir / f"{name} - pistas"
+                write_stems(prepared, folder)
+                result.outputs.append(folder)
     if "aaf" in targets and has_midi and _from_ableton(paths):
         project.warn(
             "Las pistas MIDI se exportan como notas, sin el sonido de sus instrumentos. "
@@ -187,6 +201,35 @@ def _count(n: int, singular: str, plural: str) -> str:
     return f"{n} {singular if n == 1 else plural}"
 
 
+def mix_table(project: Project) -> str:
+    """Volumen, panorama y estado de cada pista, para comprobarlos o ajustarlos a mano."""
+    rows = []
+    for track in project.tracks:
+        if track.kind not in (TrackKind.AUDIO, TrackKind.MIDI):
+            continue
+        volume = "-inf dB" if track.volume_db == float("-inf") else f"{track.volume_db:+.1f} dB"
+        if abs(track.pan) < 0.005:
+            pan = "C"
+        else:
+            pan = f"{abs(track.pan) * 100:.0f}{'L' if track.pan < 0 else 'R'}"
+        notes = []
+        if track.mute:
+            notes.append("silenciada")
+        if track.solo:
+            notes.append("solo")
+        if any(a.parameter in ("volume", "pan") for a in track.automation):
+            notes.append("con automatización" + (" (no exportada)" if track.kind == TrackKind.MIDI else ""))
+        rows.append((track.name, _KIND_LABELS[track.kind], volume, pan, ", ".join(notes)))
+    if not rows:
+        return ""
+    width = max(len(r[0]) for r in rows)
+    lines = ["Mezcla de la sesión original", "-----------------------------"]
+    lines.append(f"{'Pista':<{width}}  {'Tipo':<5}  {'Volumen':>8}  {'Pan':>4}")
+    for name, kind, volume, pan, notes in rows:
+        lines.append(f"{name:<{width}}  {kind:<5}  {volume:>8}  {pan:>4}  {notes}".rstrip())
+    return "\n".join(lines)
+
+
 def build_report(result: Result) -> str:
     parts = [summary(result.project), ""]
     if result.rendered_clips:
@@ -197,11 +240,18 @@ def build_report(result: Result) -> str:
         parts.append("")
     if result.outputs:
         parts.append("Archivos generados:")
-        parts.extend(f"  - {p.parent.name + '/' if p.suffix == '.als' else ''}{p.name}" for p in result.outputs)
+        for p in result.outputs:
+            if p.is_dir():
+                parts.append(f"  - {p.name}/ ({len(list(p.glob('*.wav')))} WAV)")
+            else:
+                parts.append(f"  - {p.parent.name + '/' if p.suffix == '.als' else ''}{p.name}")
         parts.append("")
     if result.project.warnings:
         parts.append("Avisos:")
         parts.extend(f"  - {w}" for w in result.project.warnings)
         parts.append("")
+    mix = mix_table(result.project)
+    if mix:
+        parts.extend([mix, ""])
     parts.append(IMPORT_HELP)
     return "\n".join(parts)

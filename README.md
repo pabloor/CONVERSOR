@@ -131,8 +131,10 @@ Para abrir una sesión, arrástrala a la ventana o al icono del Dock, o usa
 *Abrir con > Conversor* en el Finder.
 
 Para publicar una versión nueva: sube la versión en `pyproject.toml` y
-`src/conversor/__init__.py`, añade sus cambios a `CHANGELOG.md` y sube una
-etiqueta `vX.Y.Z`. GitHub Actions compila la aplicación y crea el Release.
+`src/conversor/__init__.py` y añade sus cambios a `CHANGELOG.md`. Después, en
+la pestaña *Actions*, elige «Aplicación para Mac», pulsa *Run workflow*, marca
+«Publicar» y lánzalo (o sube una etiqueta `vX.Y.Z`). GitHub Actions compila la
+aplicación, crea la etiqueta y el Release con el `.dmg`.
 Cada cambio subido a cualquier rama también deja el `.dmg` en la pestaña
 *Actions* (artefacto `Conversor-mac`).
 

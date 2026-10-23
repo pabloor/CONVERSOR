@@ -99,6 +99,23 @@ etc.
 
 ## Instalación
 
+### Aplicación para Mac (chip Apple)
+
+1. En GitHub, abre la pestaña *Actions*, entra en la última ejecución correcta
+   de «Aplicación para Mac» y descarga el artefacto `Conversor-mac`.
+2. Descomprime el ZIP, abre `Conversor.dmg` y arrastra **Conversor** a la
+   carpeta Aplicaciones.
+3. La primera vez, macOS la bloquea porque no está firmada por Apple. Ábrela
+   con doble clic, cierra el aviso y ve a *Ajustes del Sistema > Privacidad y
+   seguridad*. Abajo aparece «Se ha bloqueado Conversor»: pulsa *Abrir
+   igualmente* y confirma. Solo hace falta una vez.
+
+Para compilarla en tu propio Mac: crea un entorno con el proyecto y PyInstaller
+(`pip install -e . "pyinstaller>=6.10"`) y ejecuta `packaging/build_mac.sh`.
+El resultado queda en `dist/`.
+
+### Desde el código fuente
+
 Hace falta Python 3.12 o posterior (3.10 funciona, pero sin Rubber Band).
 
 ```bash

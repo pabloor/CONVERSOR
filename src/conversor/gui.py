@@ -96,11 +96,11 @@ def _is_supported(path: Path) -> bool:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, settings: QSettings | None = None):
         super().__init__()
         self.setWindowTitle(f"Conversor de sesiones {__version__}")
         self.resize(780, 760)
-        self.settings = QSettings("pabloor", "Conversor")
+        self.settings = settings or QSettings("pabloor", "Conversor")
         self._thread: QThread | None = None
         self._output_dir: Path | None = None
         self.sources: list[Path] = []

@@ -15,16 +15,14 @@ from conversor.gui import Application, MainWindow  # noqa: E402
 
 @pytest.fixture(scope="module")
 def app():
-    QSettings.setDefaultFormat(QSettings.IniFormat)
     instance = Application.instance() or Application([])
     yield instance
 
 
 @pytest.fixture
 def window(app, tmp_path):
-    for settings_format in (QSettings.NativeFormat, QSettings.IniFormat):
-        QSettings.setPath(settings_format, QSettings.UserScope, str(tmp_path / "ajustes"))
-    window = MainWindow()
+    # Ajustes en un archivo temporal: no tocan los del usuario ni pasan de una prueba a otra.
+    window = MainWindow(QSettings(str(tmp_path / "ajustes.ini"), QSettings.IniFormat))
     app.window = window
     yield window
     window.close()

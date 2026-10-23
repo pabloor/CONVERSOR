@@ -125,11 +125,9 @@ def window(tmp_path):
 
     from conversor.gui import Application, MainWindow
 
-    QSettings.setDefaultFormat(QSettings.IniFormat)
-    for settings_format in (QSettings.NativeFormat, QSettings.IniFormat):
-        QSettings.setPath(settings_format, QSettings.UserScope, str(tmp_path / "ajustes"))
     app = Application.instance() or Application([])
-    window = MainWindow()
+    # Ajustes en un archivo temporal: no tocan los del usuario ni pasan de una prueba a otra.
+    window = MainWindow(QSettings(str(tmp_path / "ajustes.ini"), QSettings.IniFormat))
     offered = []
     window.offer_update = offered.append
     window.offered = offered

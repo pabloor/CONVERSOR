@@ -1,4 +1,4 @@
-"""Escritor de archivos MIDI estándar (SMF tipo 1).
+"""Lectura y escritura de archivos MIDI estándar (SMF).
 
 Todos los DAW (Pro Tools, Logic, Cubase, FL Studio, Ableton) importan este
 formato con tempo, compás, nombres de pista, notas y controladores.
@@ -11,7 +11,7 @@ from pathlib import Path
 
 import mido
 
-from ..model import Project, TrackKind
+from ..model import MidiClip, Note, Project, TempoPoint, TimeSignature, Track, TrackKind
 
 TICKS_PER_BEAT = 960
 # Las rampas de tempo se aproximan con un cambio cada semicorchea.
@@ -115,3 +115,64 @@ def _volume_cc(db: float) -> int:
 
 def _pan_cc(pan: float) -> int:
     return max(0, min(127, int(round(64 + pan * 63))))
+
+
+def read(path: str | Path, project: Project | None = None) -> Project:
+    """Lee tempo, compás y pistas con notas. Si se pasa un proyecto, se añaden a él."""
+    path = Path(path)
+    midi = mido.MidiFile(str(path))
+    project = project or Project(name=path.stem)
+    ppq = midi.ticks_per_beat
+
+    tempo_map: list[TempoPoint] = []
+    signatures: list[TimeSignature] = []
+    for track in midi.tracks:
+        now = 0
+        for message in track:
+            now += message.time
+            beat = now / ppq
+            if message.type == "set_tempo":
+                if tempo_map and tempo_map[-1].beat == beat:
+                    tempo_map.pop()
+                tempo_map.append(TempoPoint(beat, round(mido.tempo2bpm(message.tempo), 3)))
+            elif message.type == "time_signature":
+                if signatures and signatures[-1].beat == beat:
+                    signatures.pop()
+                signatures.append(TimeSignature(beat, message.numerator, message.denominator))
+    tempo_map.sort(key=lambda p: p.beat)
+    signatures.sort(key=lambda s: s.beat)
+    if tempo_map:
+        if tempo_map[0].beat > 0:
+            tempo_map.insert(0, TempoPoint(0.0, 120.0))
+        project.tempo_map = tempo_map
+    if signatures:
+        if signatures[0].beat > 0:
+            signatures.insert(0, TimeSignature(0.0, 4, 4))
+        project.time_signatures = signatures
+
+    for index, track in enumerate(midi.tracks):
+        name = track.name.strip() or f"MIDI {index + 1}"
+        notes: list[Note] = []
+        open_notes: dict[tuple[int, int], list[tuple[float, int]]] = {}
+        now = 0
+        for message in track:
+            now += message.time
+            beat = now / ppq
+            if message.type == "note_on" and message.velocity > 0:
+                open_notes.setdefault((message.channel, message.note), []).append((beat, message.velocity))
+            elif message.type in ("note_off", "note_on"):
+                started = open_notes.get((message.channel, message.note))
+                if started:
+                    begin, velocity = started.pop(0)
+                    notes.append(Note(message.note, begin, max(beat - begin, 1 / ppq), velocity))
+        if not notes:
+            continue
+        notes.sort(key=lambda n: (n.start, n.pitch))
+        bar = 4.0 * project.time_signatures[0].numerator / project.time_signatures[0].denominator
+        start = math.floor(notes[0].start / bar) * bar
+        end = math.ceil(max(n.start + n.duration for n in notes) / bar) * bar
+        for note in notes:
+            note.start -= start
+        clip = MidiClip(name=name, start=start, length=max(end - start, bar), notes=notes)
+        project.tracks.append(Track(name=name, kind=TrackKind.MIDI, midi_clips=[clip]))
+    return project

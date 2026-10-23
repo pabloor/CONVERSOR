@@ -6,13 +6,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .formats import aaf, ableton, midi
-from .model import Project, TrackKind
+from .model import Project, TempoPoint, TrackKind
 
-READERS = {
-    ".als": ableton.read,
+SOURCE_EXTENSIONS = (".aaf", ".als", ".mid", ".midi")
+
+TARGETS = ("aaf", "midi", "ableton")
+TARGET_LABELS = {
+    "aaf": "AAF (Pro Tools, Logic, Cubase)",
+    "midi": "MIDI (todos los DAW)",
+    "ableton": "Ableton Live (.als)",
 }
-
-TARGETS = ("aaf", "midi")
 
 _KIND_LABELS = {
     TrackKind.AUDIO: "audio",
@@ -33,6 +36,13 @@ Cubase:      Archivo > Importar > Archivo AAF con el .aaf;
              Archivo > Importar > Archivo MIDI con el .mid.
 FL Studio:   no admite AAF. Importa el .mid (Archivo > Importar > Archivo MIDI)
              y arrastra los audios a la lista de reproducción.
+Ableton:     abre el .als de la carpeta "<sesión> Project". El audio está en
+             Samples/Imported dentro de esa carpeta.
+"""
+
+HOW_TO_EXPORT_PRO_TOOLS = """Desde Pro Tools: Archivo > Exportar > Pistas seleccionadas como nuevo AAF/OMF
+(formato WAV, «Incrustar audio» o «Copiar audio») y, si hay MIDI o cambios de
+tempo, también Archivo > Exportar > MIDI. Abre los dos archivos a la vez.
 """
 
 
@@ -43,40 +53,88 @@ class Result:
 
 
 def supported_extensions() -> list[str]:
-    return sorted(READERS)
+    return list(SOURCE_EXTENSIONS)
 
 
-def load(path: str | Path) -> Project:
-    path = Path(path)
-    reader = READERS.get(path.suffix.lower())
-    if reader is None:
-        raise ValueError(
-            f"Formato no compatible: '{path.suffix}'. Formatos admitidos: "
-            + ", ".join(supported_extensions())
+def default_targets(sources) -> tuple[str, ...]:
+    if any(Path(s).suffix.lower() == ".als" for s in sources):
+        return ("aaf", "midi")
+    return ("ableton",)
+
+
+def load(sources, tempo: float | None = None) -> Project:
+    """Lee una sesión de Ableton, o un AAF y/o un MIDI de la misma sesión."""
+    paths = [Path(sources)] if isinstance(sources, (str, Path)) else [Path(s) for s in sources]
+    if not paths:
+        raise ValueError("No se ha indicado ninguna sesión")
+    for path in paths:
+        if path.suffix.lower() not in SOURCE_EXTENSIONS:
+            raise ValueError(
+                f"Formato no compatible: '{path.suffix}'. Formatos admitidos: "
+                + ", ".join(SOURCE_EXTENSIONS)
+            )
+    kinds = [p.suffix.lower() for p in paths]
+    if ".als" in kinds:
+        if len(paths) > 1:
+            raise ValueError("Una sesión de Ableton se convierte sola, sin otros archivos.")
+        return ableton.read(paths[0])
+    if kinds.count(".aaf") > 1:
+        raise ValueError("Abre un solo AAF cada vez (puede acompañarse de un MIDI).")
+
+    midis = [p for p in paths if p.suffix.lower() in (".mid", ".midi")]
+    aafs = [p for p in paths if p.suffix.lower() == ".aaf"]
+    project = Project(name=(aafs or midis)[0].stem)
+    for path in midis:
+        midi.read(path, project)
+    if tempo:
+        if midis:
+            project.warn("Se usa el tempo del archivo MIDI; el tempo indicado se ignora.")
+        else:
+            project.tempo_map = [TempoPoint(0.0, float(tempo))]
+    elif aafs and not midis:
+        project.warn(
+            "El AAF no incluye el tempo de la sesión: se usa 120 BPM. Exporta también "
+            "un MIDI desde Pro Tools o indica el tempo para que la rejilla coincida."
         )
-    return reader(path)
+    for path in aafs:
+        aaf.read(path, project)
+    return project
 
 
-def convert(source: str | Path, output_dir: str | Path, targets=TARGETS) -> Result:
-    project = load(source)
+def convert(
+    sources,
+    output_dir: str | Path,
+    targets=None,
+    template: str | Path | None = None,
+    tempo: float | None = None,
+) -> Result:
+    paths = [Path(sources)] if isinstance(sources, (str, Path)) else list(sources)
+    targets = targets or default_targets(paths)
+    project = load(paths, tempo)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     result = Result(project)
-    base = output_dir / project.name
+    name = project.name
 
     has_audio = any(t.kind == TrackKind.AUDIO and t.audio_clips for t in project.tracks)
     has_midi = any(t.kind == TrackKind.MIDI for t in project.tracks)
 
     if "aaf" in targets and has_audio:
-        path = base.with_suffix(".aaf")
+        path = output_dir / f"{name}.aaf"
         aaf.write(project, path)
         result.outputs.append(path)
     if "midi" in targets and has_midi:
-        path = base.with_suffix(".mid")
+        path = output_dir / f"{name}.mid"
         midi.write(project, path)
         result.outputs.append(path)
+    if "ableton" in targets and (has_audio or has_midi):
+        path = output_dir / f"{name} Project" / f"{name}.als"
+        ableton.write(project, path, template)
+        result.outputs.append(path)
+    if not result.outputs:
+        project.warn("La sesión no tiene pistas que exportar a los formatos elegidos.")
 
-    report = output_dir / f"{project.name} - informe.txt"
+    report = output_dir / f"{name} - informe.txt"
     report.write_text(build_report(result), encoding="utf-8")
     result.outputs.append(report)
     return result
@@ -117,7 +175,7 @@ def build_report(result: Result) -> str:
     parts = [summary(result.project), ""]
     if result.outputs:
         parts.append("Archivos generados:")
-        parts.extend(f"  - {p.name}" for p in result.outputs)
+        parts.extend(f"  - {p.parent.name + '/' if p.suffix == '.als' else ''}{p.name}" for p in result.outputs)
         parts.append("")
     if result.project.warnings:
         parts.append("Avisos:")

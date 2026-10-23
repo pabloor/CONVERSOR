@@ -5,12 +5,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -25,26 +27,36 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
-from .convert import build_report, convert, load, summary, supported_extensions
+from .convert import (
+    HOW_TO_EXPORT_PRO_TOOLS,
+    TARGET_LABELS,
+    TARGETS,
+    build_report,
+    convert,
+    default_targets,
+    load,
+    summary,
+    supported_extensions,
+)
 
 
 class _Worker(QObject):
     finished = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, source: Path, output: Path, targets: tuple[str, ...]):
+    def __init__(self, sources, output, targets, template, tempo):
         super().__init__()
-        self.source, self.output, self.targets = source, output, targets
+        self.args = (sources, output, targets, template, tempo)
 
     def run(self) -> None:
         try:
-            self.finished.emit(convert(self.source, self.output, self.targets))
+            self.finished.emit(convert(*self.args))
         except Exception as error:  # noqa: BLE001 - se muestra al usuario
             self.failed.emit(str(error))
 
 
 class DropArea(QFrame):
-    dropped = Signal(Path)
+    dropped = Signal(list)
 
     def __init__(self):
         super().__init__()
@@ -52,20 +64,22 @@ class DropArea(QFrame):
         self.setFrameShape(QFrame.StyledPanel)
         self.setMinimumHeight(90)
         layout = QVBoxLayout(self)
-        self.label = QLabel("Arrastra aquí una sesión\n(" + ", ".join(supported_extensions()) + ")")
-        self.label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.label)
+        label = QLabel(
+            "Arrastra aquí una sesión de Ableton (.als)\n"
+            "o el AAF y el MIDI exportados de Pro Tools"
+        )
+        label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(label)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if any(_is_supported(Path(u.toLocalFile())) for u in event.mimeData().urls()):
             event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent) -> None:
-        for url in event.mimeData().urls():
-            path = Path(url.toLocalFile())
-            if _is_supported(path):
-                self.dropped.emit(path)
-                return
+        paths = [Path(u.toLocalFile()) for u in event.mimeData().urls()]
+        paths = [p for p in paths if _is_supported(p)]
+        if paths:
+            self.dropped.emit(paths)
 
 
 def _is_supported(path: Path) -> bool:
@@ -76,28 +90,44 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"Conversor de sesiones {__version__}")
-        self.resize(720, 560)
+        self.resize(760, 680)
         self._thread: QThread | None = None
         self._output_dir: Path | None = None
+        self.sources: list[Path] = []
 
         self.drop = DropArea()
-        self.drop.dropped.connect(self.set_source)
+        self.drop.dropped.connect(self.set_sources)
 
         self.source_edit = QLineEdit()
         self.source_edit.setReadOnly(True)
         self.source_edit.setPlaceholderText("Ninguna sesión seleccionada")
-        open_button = QPushButton("Abrir sesión…")
-        open_button.clicked.connect(self.choose_source)
+        open_button = QPushButton("Abrir…")
+        open_button.clicked.connect(self.choose_sources)
 
         self.output_edit = QLineEdit()
         self.output_edit.setPlaceholderText("Carpeta de destino")
         output_button = QPushButton("Cambiar…")
         output_button.clicked.connect(self.choose_output)
 
-        self.aaf_check = QCheckBox("AAF: pistas y clips de audio (Pro Tools, Logic, Cubase)")
-        self.midi_check = QCheckBox("MIDI: notas, tempo y compás (todos los DAW)")
-        self.aaf_check.setChecked(True)
-        self.midi_check.setChecked(True)
+        self.target_checks = {name: QCheckBox(TARGET_LABELS[name]) for name in TARGETS}
+
+        self.tempo_spin = QDoubleSpinBox()
+        self.tempo_spin.setRange(0, 999)
+        self.tempo_spin.setDecimals(2)
+        self.tempo_spin.setSpecialValueText("del MIDI (o 120)")
+        self.tempo_spin.setSuffix(" BPM")
+        self.tempo_spin.valueChanged.connect(self.refresh_preview)
+        self.template_edit = QLineEdit()
+        self.template_edit.setPlaceholderText("Plantilla incluida (formato Live 11)")
+        template_button = QPushButton("Elegir…")
+        template_button.clicked.connect(self.choose_template)
+        self.reverse_box = QGroupBox("Opciones para Ableton")
+        reverse_layout = QFormLayout(self.reverse_box)
+        reverse_layout.addRow("Tempo si no hay MIDI:", self.tempo_spin)
+        template_row = QHBoxLayout()
+        template_row.addWidget(self.template_edit)
+        template_row.addWidget(template_button)
+        reverse_layout.addRow("Plantilla (.als vacío):", template_row)
 
         self.convert_button = QPushButton("Convertir")
         self.convert_button.setEnabled(False)
@@ -108,6 +138,7 @@ class MainWindow(QMainWindow):
 
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
+        self.log.setPlainText(HOW_TO_EXPORT_PRO_TOOLS)
 
         source_row = QHBoxLayout()
         source_row.addWidget(self.source_edit)
@@ -118,8 +149,8 @@ class MainWindow(QMainWindow):
 
         targets_box = QGroupBox("Formatos de salida")
         targets_layout = QVBoxLayout(targets_box)
-        targets_layout.addWidget(self.aaf_check)
-        targets_layout.addWidget(self.midi_check)
+        for check in self.target_checks.values():
+            targets_layout.addWidget(check)
 
         buttons = QHBoxLayout()
         buttons.addStretch()
@@ -128,36 +159,63 @@ class MainWindow(QMainWindow):
 
         layout = QVBoxLayout()
         layout.addWidget(self.drop)
-        layout.addWidget(QLabel("Sesión de origen"))
+        layout.addWidget(QLabel("Origen"))
         layout.addLayout(source_row)
         layout.addWidget(QLabel("Destino"))
         layout.addLayout(output_row)
-        layout.addWidget(targets_box)
+        options = QHBoxLayout()
+        options.addWidget(targets_box)
+        options.addWidget(self.reverse_box, 1)
+        layout.addLayout(options)
         layout.addLayout(buttons)
         layout.addWidget(self.log, 1)
         central = QWidget()
         central.setLayout(layout)
         self.setCentralWidget(central)
+        self._update_targets()
 
-    def choose_source(self) -> None:
+    def choose_sources(self) -> None:
         patterns = " ".join(f"*{ext}" for ext in supported_extensions())
-        filename, _ = QFileDialog.getOpenFileName(
-            self, "Abrir sesión", "", f"Sesiones ({patterns})"
+        filenames, _ = QFileDialog.getOpenFileNames(
+            self, "Abrir sesión (puedes elegir un AAF y un MIDI a la vez)", "", f"Sesiones ({patterns})"
         )
-        if filename:
-            self.set_source(Path(filename))
+        if filenames:
+            self.set_sources([Path(f) for f in filenames])
 
     def choose_output(self) -> None:
         directory = QFileDialog.getExistingDirectory(self, "Carpeta de destino", self.output_edit.text())
         if directory:
             self.output_edit.setText(directory)
 
-    def set_source(self, path: Path) -> None:
-        self.source_edit.setText(str(path))
-        self.output_edit.setText(str(path.parent / f"{path.stem} (convertido)"))
+    def choose_template(self) -> None:
+        filename, _ = QFileDialog.getOpenFileName(self, "Set vacío de Ableton", "", "Sets de Ableton (*.als)")
+        self.template_edit.setText(filename)
+
+    def set_sources(self, paths: list[Path]) -> None:
+        self.sources = paths
+        self.source_edit.setText("  +  ".join(p.name for p in paths))
+        first = paths[0]
+        self.output_edit.setText(str(first.parent / f"{first.stem} (convertido)"))
         self.show_button.setEnabled(False)
+        self._update_targets()
+        self.refresh_preview()
+
+    def _update_targets(self) -> None:
+        from_ableton = any(p.suffix.lower() == ".als" for p in self.sources)
+        defaults = default_targets(self.sources) if self.sources else ()
+        for name, check in self.target_checks.items():
+            check.setEnabled(bool(self.sources) and (name != "ableton") == from_ableton)
+            check.setChecked(name in defaults)
+        self.reverse_box.setEnabled(bool(self.sources) and not from_ableton)
+
+    def _tempo(self) -> float | None:
+        return self.tempo_spin.value() or None
+
+    def refresh_preview(self) -> None:
+        if not self.sources:
+            return
         try:
-            project = load(path)
+            project = load(self.sources, self._tempo())
         except Exception as error:  # noqa: BLE001
             self.convert_button.setEnabled(False)
             self.log.setPlainText(f"No se puede leer la sesión:\n{error}")
@@ -170,23 +228,23 @@ class MainWindow(QMainWindow):
 
     def start_conversion(self) -> None:
         targets = tuple(
-            name
-            for name, check in (("aaf", self.aaf_check), ("midi", self.midi_check))
-            if check.isChecked()
+            name for name, check in self.target_checks.items() if check.isEnabled() and check.isChecked()
         )
         if not targets:
             QMessageBox.warning(self, "Conversor", "Elige al menos un formato de salida.")
             return
-        source = Path(self.source_edit.text())
         output = Path(self.output_edit.text())
+        self._output_dir = output
+        template = self.template_edit.text() or None
         self.convert_button.setEnabled(False)
         self.log.setPlainText("Convirtiendo…")
 
         self._thread = QThread(self)
-        worker = _Worker(source, output, targets)
+        worker = _Worker(self.sources, output, targets, template, self._tempo())
         worker.moveToThread(self._thread)
         self._thread.started.connect(worker.run)
-        worker.finished.connect(lambda result: self.conversion_done(result, output))
+        # Métodos de la ventana (no lambdas) para que Qt los ejecute en el hilo principal.
+        worker.finished.connect(self.conversion_done)
         worker.failed.connect(self.conversion_failed)
         for signal in (worker.finished, worker.failed):
             signal.connect(self._thread.quit)
@@ -194,12 +252,13 @@ class MainWindow(QMainWindow):
         self._worker = worker
         self._thread.start()
 
-    def conversion_done(self, result, output: Path) -> None:
-        self._output_dir = output
+    @Slot(object)
+    def conversion_done(self, result) -> None:
         self.log.setPlainText(build_report(result))
         self.convert_button.setEnabled(True)
         self.show_button.setEnabled(True)
 
+    @Slot(str)
     def conversion_failed(self, message: str) -> None:
         self.log.setPlainText(f"Error durante la conversión:\n{message}")
         self.convert_button.setEnabled(True)
@@ -212,8 +271,9 @@ class MainWindow(QMainWindow):
 def main() -> int:
     app = QApplication(sys.argv)
     window = MainWindow()
-    if len(sys.argv) > 1:
-        window.set_source(Path(sys.argv[1]))
+    paths = [Path(a) for a in sys.argv[1:] if _is_supported(Path(a))]
+    if paths:
+        window.set_sources(paths)
     window.show()
     return app.exec()
 

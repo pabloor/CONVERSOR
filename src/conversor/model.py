@@ -8,6 +8,7 @@ dentro de un archivo de audio se guardan en segundos.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -98,6 +99,9 @@ class Project:
     )
     tracks: list[Track] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Audio que aún no existe como archivo (p. ej. incrustado en un AAF):
+    # ruta prevista -> función que lo escribe en la ruta de destino indicada.
+    embedded_media: dict[Path, Callable[[Path], None]] = field(default_factory=dict)
 
     def warn(self, message: str) -> None:
         if message not in self.warnings:
@@ -127,6 +131,20 @@ class Project:
                 if end >= beat:
                     return seconds
         return seconds + (beat - position) * 60.0 / bpm
+
+    def seconds_to_beats(self, seconds: float) -> float:
+        if seconds <= 0:
+            return 0.0
+        low, high = 0.0, 1.0
+        while self.beats_to_seconds(high) < seconds:
+            high *= 2
+        for _ in range(60):
+            mid = (low + high) / 2
+            if self.beats_to_seconds(mid) < seconds:
+                low = mid
+            else:
+                high = mid
+        return (low + high) / 2
 
     def tempo_at(self, beat: float) -> float:
         points = sorted(self.tempo_map, key=lambda p: p.beat)

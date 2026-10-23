@@ -1,14 +1,22 @@
-"""Lector de sesiones de Ableton Live (.als, XML comprimido con gzip).
+"""Lectura y escritura de sesiones de Ableton Live (.als, XML comprimido con gzip).
 
-Probado con la estructura de Live 10, 11 y 12. Solo se leen los clips del
-arreglo (Arrangement View); los clips de la vista Session se ignoran.
+Lectura: estructura de Live 10, 11 y 12. Solo se leen los clips del arreglo
+(Arrangement View); los clips de la vista Session se ignoran.
+
+Escritura: se parte de una plantilla (la incluida, con formato de Live 11, o un
+set vacío guardado con la versión de Ableton del usuario) y se duplican su
+primera pista de audio y su primera pista MIDI para cada pista del proyecto.
 """
 
 from __future__ import annotations
 
+import copy
 import gzip
 import math
+import shutil
+import wave
 import xml.etree.ElementTree as ET
+from importlib import resources
 from pathlib import Path
 
 from ..model import (
@@ -22,6 +30,7 @@ from ..model import (
     TimeSignature,
     Track,
     TrackKind,
+    db_to_gain,
     gain_to_db,
 )
 
@@ -371,3 +380,393 @@ def _warp_beat_to_seconds(markers: list[tuple[float, float]], beat: float) -> fl
                 return s0
             return s0 + (beat - b0) * (s1 - s0) / (b1 - b0)
     return markers[-1][1]
+
+
+# --- Escritura ---------------------------------------------------------------
+
+_MIN_GAIN = 0.0003162277571
+_MAX_GAIN = 1.99526238
+_TEMPO_RANGE = (20.0, 999.0)
+
+
+def write(project: Project, path: str | Path, template: str | Path | None = None) -> Path:
+    """Escribe el proyecto como set de Ableton y copia el audio a Samples/Imported.
+
+    `path` es la ruta del .als; el audio se guarda en la misma carpeta.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    root = _load_template(template)
+    liveset = root.find("LiveSet")
+    writer = _Writer(project, root, path.parent)
+    writer.write_tracks(liveset)
+    writer.write_master(liveset)
+    liveset.find("NextPointeeId").set("Value", str(writer.next_pointee))
+    data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    path.write_bytes(gzip.compress(data))
+    return path
+
+
+def _load_template(template: str | Path | None) -> ET.Element:
+    if template is None:
+        data = resources.files("conversor").joinpath("templates/ableton11.xml").read_bytes()
+    else:
+        data = Path(template).read_bytes()
+        if data[:2] == b"\x1f\x8b":
+            data = gzip.decompress(data)
+    root = ET.fromstring(data)
+    if root.find("LiveSet") is None:
+        raise ValueError("La plantilla no es un set de Ableton Live")
+    return root
+
+
+def _is_pointee(element: ET.Element) -> bool:
+    tag = element.tag
+    return "Id" in element.attrib and (
+        tag.endswith("Target") or tag == "Pointee" or tag.startswith("ControllerTargets")
+    )
+
+
+def _sub(parent: ET.Element, tag: str, value=None, **attrs) -> ET.Element:
+    element = ET.SubElement(parent, tag, {k: str(v) for k, v in attrs.items()})
+    if value is not None:
+        element.set("Value", _fmt(value))
+    return element
+
+
+def _fmt(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        return f"{value:.10f}".rstrip("0").rstrip(".")
+    return str(value)
+
+
+def _set(element: ET.Element | None, path: str, value) -> None:
+    if element is None:
+        return
+    found = element.find(path)
+    if found is not None:
+        found.set("Value", _fmt(value))
+
+
+def _encode_time_signature(numerator: int, denominator: int) -> int:
+    index = _DENOMINATORS.index(denominator) if denominator in _DENOMINATORS else 2
+    return index * 99 + max(1, min(99, numerator)) - 1
+
+
+class _Writer:
+    def __init__(self, project: Project, root: ET.Element, folder: Path):
+        self.project = project
+        self.folder = folder
+        self.samples = folder / "Samples" / "Imported"
+        ids = [int(e.get("Id")) for e in root.iter() if _is_pointee(e)]
+        declared = root.find("LiveSet/NextPointeeId")
+        self.next_pointee = max(ids + [int(declared.get("Value", "0")) - 1 if declared is not None else 0]) + 1
+        self.copied: dict[Path, Path] = {}
+
+    def _pointee(self) -> int:
+        value = self.next_pointee
+        self.next_pointee += 1
+        return value
+
+    # --- Pistas ---
+
+    def write_tracks(self, liveset: ET.Element) -> None:
+        tracks = liveset.find("Tracks")
+        prototypes = {
+            TrackKind.AUDIO: tracks.find("AudioTrack"),
+            TrackKind.MIDI: tracks.find("MidiTrack"),
+        }
+        track_id = max((int(t.get("Id", "0")) for t in tracks), default=0) + 1
+        for element in list(tracks):
+            if element.tag != "ReturnTrack":
+                tracks.remove(element)
+        position = 0
+        for track in self.project.tracks:
+            prototype = prototypes.get(track.kind)
+            if track.kind not in prototypes:
+                continue
+            if prototype is None:
+                raise ValueError(
+                    "La plantilla necesita al menos una pista de audio y una pista MIDI."
+                )
+            element = copy.deepcopy(prototype)
+            element.set("Id", str(track_id))
+            track_id += 1
+            for child in element.iter():
+                if _is_pointee(child):
+                    child.set("Id", str(self._pointee()))
+            self._fill_track(element, track)
+            tracks.insert(position, element)
+            position += 1
+
+    def _fill_track(self, element: ET.Element, track: Track) -> None:
+        _set(element, "Name/EffectiveName", track.name)
+        _set(element, "Name/UserName", track.name)
+        _set(element, "TrackGroupId", -1)
+        mixer = element.find("DeviceChain/Mixer")
+        _set(mixer, "Volume/Manual", self._gain(track.volume_db))
+        _set(mixer, "Pan/Manual", max(-1.0, min(1.0, track.pan)))
+        _set(mixer, "Speaker/Manual", not track.mute)
+        _set(mixer, "SoloSink", track.solo)
+
+        envelopes = element.find("AutomationEnvelopes/Envelopes")
+        for child in list(envelopes):
+            envelopes.remove(child)
+        targets = {"volume": "Volume", "pan": "Pan", "mute": "Speaker"}
+        for automation in track.automation:
+            target = mixer.find(f"{targets[automation.parameter]}/AutomationTarget")
+            if target is None or not automation.points:
+                continue
+            if automation.parameter == "volume":
+                values = [(p.beat, self._gain(p.value)) for p in automation.points]
+            elif automation.parameter == "pan":
+                values = [(p.beat, max(-1.0, min(1.0, p.value))) for p in automation.points]
+            else:
+                values = [(p.beat, p.value < 0.5) for p in automation.points]
+            self._envelope(envelopes, target.get("Id"), values)
+
+        sequencer = element.find("DeviceChain/MainSequencer")
+        if track.kind == TrackKind.AUDIO:
+            events = sequencer.find("Sample/ArrangerAutomation/Events")
+        else:
+            events = sequencer.find("ClipTimeable/ArrangerAutomation/Events")
+        for child in list(events):
+            events.remove(child)
+        if track.kind == TrackKind.AUDIO:
+            for index, clip in enumerate(sorted(track.audio_clips, key=lambda c: c.start)):
+                self._audio_clip(events, index, clip)
+        else:
+            for index, clip in enumerate(sorted(track.midi_clips, key=lambda c: c.start)):
+                self._midi_clip(events, index, clip)
+
+    @staticmethod
+    def _gain(db: float) -> float:
+        return max(_MIN_GAIN, min(_MAX_GAIN, db_to_gain(db)))
+
+    def _envelope(self, envelopes: ET.Element, pointee: str, values) -> None:
+        envelope = _sub(envelopes, "AutomationEnvelope", Id=len(envelopes))
+        _sub(_sub(envelope, "EnvelopeTarget"), "PointeeId", pointee)
+        automation = _sub(envelope, "Automation")
+        events = _sub(automation, "Events")
+        kind = "BoolEvent" if isinstance(values[0][1], bool) else "FloatEvent"
+        first = values[0][1]
+        _sub(events, kind, Id=0, Time=_fmt(_PRE_START), Value=_fmt(first))
+        for index, (beat, value) in enumerate(values, start=1):
+            _sub(events, kind, Id=index, Time=_fmt(float(beat)), Value=_fmt(value))
+        transform = _sub(automation, "AutomationTransformViewState")
+        _sub(transform, "IsTransformPending", False)
+        _sub(transform, "TimeAndValueTransforms")
+
+    # --- Clips ---
+
+    def _clip_common(self, clip: ET.Element, start: float, length: float, loop_start: float,
+                     loop_end: float, name: str, color: int) -> None:
+        _sub(clip, "LomId", 0)
+        _sub(clip, "LomIdView", 0)
+        _sub(clip, "CurrentStart", start)
+        _sub(clip, "CurrentEnd", start + length)
+        loop = _sub(clip, "Loop")
+        _sub(loop, "LoopStart", loop_start)
+        _sub(loop, "LoopEnd", loop_end)
+        _sub(loop, "StartRelative", 0)
+        _sub(loop, "LoopOn", False)
+        _sub(loop, "OutMarker", loop_end)
+        _sub(loop, "HiddenLoopStart", loop_start)
+        _sub(loop, "HiddenLoopEnd", loop_end)
+        _sub(clip, "Name", name)
+        _sub(clip, "Annotation", "")
+        _sub(clip, "Color", color)
+        _sub(clip, "LaunchMode", 0)
+        _sub(clip, "LaunchQuantisation", 0)
+        signature = self.project.time_signatures[0]
+        remote = _sub(_sub(_sub(clip, "TimeSignature"), "TimeSignatures"), "RemoteableTimeSignature", Id=0)
+        _sub(remote, "Numerator", signature.numerator)
+        _sub(remote, "Denominator", signature.denominator)
+        _sub(remote, "Time", 0)
+        _sub(_sub(clip, "Envelopes"), "Envelopes")
+        scroller = _sub(clip, "ScrollerTimePreserver")
+        _sub(scroller, "LeftTime", 0)
+        _sub(scroller, "RightTime", 0)
+        selection = _sub(clip, "TimeSelection")
+        _sub(selection, "AnchorTime", 0)
+        _sub(selection, "OtherTime", 0)
+        _sub(clip, "Legato", False)
+        _sub(clip, "Ram", False)
+        _sub(_sub(clip, "GrooveSettings"), "GrooveId", -1)
+        _sub(clip, "Disabled", False)
+        _sub(clip, "VelocityAmount", 0)
+        follow = _sub(clip, "FollowAction")
+        for tag, value in (
+            ("FollowTime", 4), ("IsLinked", True), ("LoopIterations", 1), ("FollowActionA", 4),
+            ("FollowActionB", 0), ("FollowChanceA", 100), ("FollowChanceB", 0),
+            ("JumpIndexA", 1), ("JumpIndexB", 1), ("FollowActionEnabled", False),
+        ):
+            _sub(follow, tag, value)
+        grid = _sub(clip, "Grid")
+        for tag, value in (
+            ("FixedNumerator", 1), ("FixedDenominator", 16), ("GridIntervalPixel", 20),
+            ("Ntoles", 2), ("SnapToGrid", True), ("Fixed", False),
+        ):
+            _sub(grid, tag, value)
+        _sub(clip, "FreezeStart", 0)
+        _sub(clip, "FreezeEnd", 0)
+
+    def _audio_clip(self, events: ET.Element, index: int, audio: AudioClip) -> None:
+        if audio.file is None:
+            return
+        file, frames, rate = self._sample(audio.file)
+        seconds = self.project.beats_to_seconds(audio.start + audio.length) - self.project.beats_to_seconds(audio.start)
+        clip = _sub(events, "AudioClip", Id=index, Time=_fmt(float(audio.start)))
+        loop_start = audio.source_offset
+        self._clip_common(clip, audio.start, audio.length, loop_start, loop_start + seconds, audio.name, 16)
+        _sub(clip, "IsWarped", False)
+        _sub(clip, "TakeId", 1)
+        sample_ref = _sub(clip, "SampleRef")
+        file_ref = _sub(sample_ref, "FileRef")
+        try:
+            relative = file.relative_to(self.folder).as_posix()
+            relative_type = 3
+        except ValueError:
+            relative, relative_type = "", 0
+        _sub(file_ref, "RelativePathType", relative_type)
+        _sub(file_ref, "RelativePath", relative)
+        _sub(file_ref, "Path", str(file.resolve()))
+        _sub(file_ref, "Type", 1)
+        _sub(file_ref, "LivePackName", "")
+        _sub(file_ref, "LivePackId", "")
+        _sub(file_ref, "OriginalFileSize", file.stat().st_size if file.exists() else 0)
+        _sub(file_ref, "OriginalCrc", 0)
+        _sub(sample_ref, "LastModDate", 0)
+        _sub(sample_ref, "SourceContext")
+        _sub(sample_ref, "SampleUsageHint", 0)
+        _sub(sample_ref, "DefaultDuration", frames)
+        _sub(sample_ref, "DefaultSampleRate", rate)
+        onsets = _sub(clip, "Onsets")
+        _sub(onsets, "UserOnsets")
+        _sub(onsets, "HasUserOnsets", False)
+        for tag, value in (
+            ("WarpMode", 0), ("GranularityTones", 30), ("GranularityTexture", 65),
+            ("FluctuationTexture", 25), ("TransientResolution", 6), ("TransientLoopMode", 2),
+            ("TransientEnvelope", 100), ("ComplexProFormants", 100), ("ComplexProEnvelope", 128),
+            ("Sync", True), ("HiQ", True), ("Fade", True),
+        ):
+            _sub(clip, tag, value)
+        fades = _sub(clip, "Fades")
+        for tag, value in (
+            ("FadeInLength", 0), ("FadeOutLength", 0), ("ClipFadesAreInitialized", True),
+            ("CrossfadeInState", 0), ("FadeInCurveSkew", 0), ("FadeInCurveSlope", 0),
+            ("FadeOutCurveSkew", 0), ("FadeOutCurveSlope", 0), ("IsDefaultFadeIn", True),
+            ("IsDefaultFadeOut", True),
+        ):
+            _sub(fades, tag, value)
+        _sub(clip, "PitchCoarse", 0)
+        _sub(clip, "PitchFine", 0)
+        _sub(clip, "SampleVolume", db_to_gain(audio.gain_db))
+        bpm = self.project.tempo_at(audio.start)
+        markers = _sub(clip, "WarpMarkers")
+        _sub(markers, "WarpMarker", Id=0, SecTime="0", BeatTime="0")
+        _sub(markers, "WarpMarker", Id=1, SecTime="1", BeatTime=_fmt(bpm / 60.0))
+        _sub(clip, "SavedWarpMarkersForStretched")
+        _sub(clip, "MarkersGenerated", False)
+        _sub(clip, "IsSongTempoLeader", False)
+
+    def _sample(self, source: Path) -> tuple[Path, int, int]:
+        """Lleva el audio a Samples/Imported y devuelve (ruta, muestras, frecuencia)."""
+        if source not in self.copied:
+            target = self.samples / source.name
+            n = 2
+            while target in self.copied.values():
+                target = self.samples / f"{source.stem} {n}{source.suffix}"
+                n += 1
+            if source in self.project.embedded_media:
+                self.samples.mkdir(parents=True, exist_ok=True)
+                self.project.embedded_media[source](target)
+            elif source.exists():
+                self.samples.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+            else:
+                target = source
+            self.copied[source] = target
+        target = self.copied[source]
+        try:
+            with wave.open(str(target), "rb") as wav:
+                return target, wav.getnframes(), wav.getframerate()
+        except (OSError, wave.Error, EOFError):
+            return target, 0, 44100
+
+    def _midi_clip(self, events: ET.Element, index: int, midi: MidiClip) -> None:
+        clip = _sub(events, "MidiClip", Id=index, Time=_fmt(float(midi.start)))
+        self._clip_common(clip, midi.start, midi.length, 0, midi.length, midi.name, 9)
+        _sub(clip, "IsWarped", True)
+        _sub(clip, "TakeId", 1)
+        notes = _sub(clip, "Notes")
+        key_tracks = _sub(notes, "KeyTracks")
+        by_pitch: dict[int, list[Note]] = {}
+        for note in midi.notes:
+            by_pitch.setdefault(note.pitch, []).append(note)
+        note_id = 1
+        for key_index, pitch in enumerate(sorted(by_pitch)):
+            key_track = _sub(key_tracks, "KeyTrack", Id=key_index)
+            events_el = _sub(key_track, "Notes")
+            for note in sorted(by_pitch[pitch], key=lambda n: n.start):
+                _sub(
+                    events_el, "MidiNoteEvent",
+                    Time=_fmt(float(note.start)), Duration=_fmt(float(max(note.duration, 1e-3))),
+                    Velocity=_fmt(float(max(1, min(127, note.velocity)))), VelocityDeviation="0",
+                    OffVelocity="64", Probability="1", IsEnabled="true", NoteId=note_id,
+                )
+                note_id += 1
+            _sub(key_track, "MidiKey", pitch)
+        _sub(_sub(notes, "PerNoteEventStore"), "EventLists")
+        _sub(notes, "NoteProbabilityGroups")
+        _sub(_sub(notes, "ProbabilityGroupIdGenerator"), "NextId", 1)
+        _sub(_sub(notes, "NoteIdGenerator"), "NextId", note_id)
+        _sub(clip, "BankSelectCoarse", -1)
+        _sub(clip, "BankSelectFine", -1)
+        _sub(clip, "ProgramChange", -1)
+
+    # --- Tempo y compás ---
+
+    def write_master(self, liveset: ET.Element) -> None:
+        master = liveset.find("MainTrack")
+        if master is None:
+            master = liveset.find("MasterTrack")
+        mixer = master.find("DeviceChain/Mixer")
+        points = sorted(self.project.tempo_map, key=lambda p: p.beat)
+        low, high = _TEMPO_RANGE
+        bpm = lambda value: max(low, min(high, value))  # noqa: E731
+        _set(mixer, "Tempo/Manual", bpm(points[0].bpm))
+        signatures = self.project.time_signatures
+        first = signatures[0]
+        _set(mixer, "TimeSignature/Manual", _encode_time_signature(first.numerator, first.denominator))
+
+        envelopes = master.find("AutomationEnvelopes/Envelopes")
+        tempo_id = mixer.find("Tempo/AutomationTarget").get("Id")
+        signature_id = mixer.find("TimeSignature/AutomationTarget").get("Id")
+        for envelope in list(envelopes):
+            if _value(envelope, "EnvelopeTarget/PointeeId") in (tempo_id, signature_id):
+                envelopes.remove(envelope)
+
+        if len(points) > 1:
+            values = []
+            for previous, point in zip(points, points[1:]):
+                if not previous.ramp:
+                    values.append((point.beat, bpm(previous.bpm)))
+                values.append((point.beat, bpm(point.bpm)))
+            values.insert(0, (0.0, bpm(points[0].bpm)))
+            self._envelope(envelopes, tempo_id, values)
+        if len(signatures) > 1:
+            envelope = _sub(envelopes, "AutomationEnvelope", Id=len(envelopes))
+            _sub(_sub(envelope, "EnvelopeTarget"), "PointeeId", signature_id)
+            automation = _sub(envelope, "Automation")
+            events = _sub(automation, "Events")
+            _sub(events, "EnumEvent", Id=0, Time=_fmt(_PRE_START),
+                 Value=_encode_time_signature(first.numerator, first.denominator))
+            for index, signature in enumerate(signatures[1:], start=1):
+                _sub(events, "EnumEvent", Id=index, Time=_fmt(float(signature.beat)),
+                     Value=_encode_time_signature(signature.numerator, signature.denominator))
+            transform = _sub(automation, "AutomationTransformViewState")
+            _sub(transform, "IsTransformPending", False)
+            _sub(transform, "TimeAndValueTransforms")

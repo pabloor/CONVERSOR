@@ -22,7 +22,8 @@ def app():
 
 @pytest.fixture
 def window(app, tmp_path):
-    QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, str(tmp_path / "ajustes"))
+    for settings_format in (QSettings.NativeFormat, QSettings.IniFormat):
+        QSettings.setPath(settings_format, QSettings.UserScope, str(tmp_path / "ajustes"))
     window = MainWindow()
     app.window = window
     yield window

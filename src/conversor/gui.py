@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QSettings, Qt, QThread, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QAction, QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -28,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __version__
+from . import __version__, update
 from .convert import (
     HOW_TO_EXPORT_PRO_TOOLS,
     TARGET_LABELS,
@@ -208,6 +209,127 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self._update_targets()
 
+        self._update_thread: QThread | None = None
+        self._pending_update: update.Update | None = None
+        self._create_menu()
+        if self.auto_update_action.isChecked() and update.installed_app() is not None:
+            # Tras abrir la ventana, para no retrasar el arranque.
+            QTimer.singleShot(1500, lambda: self.check_for_updates(manual=False))
+
+    # --- Actualizaciones ---
+
+    def _create_menu(self) -> None:
+        menu = self.menuBar().addMenu("Ayuda")
+        check_action = QAction("Buscar actualizaciones…", self)
+        check_action.setMenuRole(QAction.ApplicationSpecificRole)
+        check_action.triggered.connect(lambda: self.check_for_updates(manual=True))
+        menu.addAction(check_action)
+        self.auto_update_action = QAction("Buscar actualizaciones al abrir", self)
+        self.auto_update_action.setCheckable(True)
+        self.auto_update_action.setChecked(self.settings.value("auto_update", "true") == "true")
+        self.auto_update_action.toggled.connect(
+            lambda on: self.settings.setValue("auto_update", "true" if on else "false")
+        )
+        menu.addAction(self.auto_update_action)
+        releases = QAction("Página de versiones", self)
+        releases.triggered.connect(lambda: QDesktopServices.openUrl(QUrl(update.RELEASES_PAGE)))
+        menu.addAction(releases)
+
+    def _run_update_job(self, job, done, failed) -> None:
+        self._update_thread = QThread(self)
+        worker = _Worker(job)
+        worker.moveToThread(self._update_thread)
+        self._update_thread.started.connect(worker.run)
+        worker.progress.connect(self.conversion_progress)
+        worker.finished.connect(done)
+        worker.failed.connect(failed)
+        for signal in (worker.finished, worker.failed):
+            signal.connect(self._update_thread.quit)
+            signal.connect(worker.deleteLater)
+        self._update_worker = worker
+        self._update_thread.start()
+
+    def check_for_updates(self, manual: bool) -> None:
+        if self._update_thread is not None and self._update_thread.isRunning():
+            return
+        self._manual_check = manual
+        self._run_update_job(lambda progress: update.check(), self.update_checked, self.update_check_failed)
+
+    @Slot(object)
+    def update_checked(self, available) -> None:
+        if available is None:
+            if self._manual_check:
+                QMessageBox.information(self, "Conversor", f"Tienes la última versión ({__version__}).")
+            return
+        if not self._manual_check and self.settings.value("skipped_version", "") == available.version:
+            return
+        if self._thread is not None and self._thread.isRunning():
+            # No se interrumpe una conversión: se pregunta al terminar.
+            self._pending_update = available
+            return
+        self.offer_update(available)
+
+    @Slot(str)
+    def update_check_failed(self, message: str) -> None:
+        if self._manual_check:
+            QMessageBox.warning(self, "Conversor", message)
+
+    def offer_update(self, available: update.Update) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle("Actualización disponible")
+        box.setText(f"Hay una versión nueva de Conversor: {available.version} (tienes la {__version__}).")
+        if available.notes:
+            box.setInformativeText("Novedades:")
+            box.setDetailedText(available.notes)
+        install = box.addButton("Actualizar", QMessageBox.AcceptRole)
+        later = box.addButton("Más tarde", QMessageBox.RejectRole)
+        skip = box.addButton("Saltar esta versión", QMessageBox.DestructiveRole)
+        box.setDefaultButton(install)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is skip:
+            self.settings.setValue("skipped_version", available.version)
+        elif clicked is install:
+            self.install_update(available)
+        del later
+
+    def install_update(self, available: update.Update) -> None:
+        app = update.installed_app()
+        if not update.can_install(app):
+            # Desde el código fuente, o sin permiso para escribir en la carpeta de la aplicación.
+            QMessageBox.information(
+                self, "Conversor",
+                "No se puede actualizar automáticamente desde aquí. Se abrirá la página de "
+                "la versión nueva para descargarla.",
+            )
+            QDesktopServices.openUrl(QUrl(available.page))
+            return
+        self.convert_button.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.progress_bar.show()
+        self.progress_label.setText(f"Descargando la versión {available.version}…")
+        workdir = Path(tempfile.mkdtemp(prefix="conversor-descarga-"))
+
+        def job(progress):
+            dmg = update.download(available, workdir, lambda f: progress(0.9 * f, "Descargando la actualización…"))
+            progress(0.95, "Preparando la actualización…")
+            return update.stage(dmg, app, available.version)
+
+        self._run_update_job(job, self.update_staged, self.update_failed)
+
+    @Slot(object)
+    def update_staged(self, staged) -> None:
+        self.progress_label.setText("Reiniciando con la versión nueva…")
+        update.replace_after_exit(update.installed_app(), Path(staged))
+        QApplication.quit()
+
+    @Slot(str)
+    def update_failed(self, message: str) -> None:
+        self.progress_bar.hide()
+        self.progress_label.setText("")
+        self.convert_button.setEnabled(bool(self.sources))
+        QMessageBox.warning(self, "Conversor", f"No se ha podido actualizar:\n{message}")
+
     # --- Origen y destino ---
 
     def _last_folder(self) -> str:
@@ -360,6 +482,12 @@ class MainWindow(QMainWindow):
         self.progress_label.setText("Terminado")
         self.convert_button.setEnabled(True)
         self.show_button.setEnabled(True)
+        self._offer_pending_update()
+
+    def _offer_pending_update(self) -> None:
+        if self._pending_update is not None:
+            available, self._pending_update = self._pending_update, None
+            QTimer.singleShot(0, lambda: self.offer_update(available))
 
     @Slot(str)
     def conversion_failed(self, message: str) -> None:
@@ -367,6 +495,7 @@ class MainWindow(QMainWindow):
         self.progress_label.setText("")
         self.log.setPlainText(f"Error durante la conversión:\n{message}")
         self.convert_button.setEnabled(True)
+        self._offer_pending_update()
 
     def open_output(self) -> None:
         if self._output_dir:

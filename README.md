@@ -130,6 +130,13 @@ etc.
 Para abrir una sesión, arrástrala a la ventana o al icono del Dock, o usa
 *Abrir con > Conversor* en el Finder.
 
+**Actualizaciones:** al abrirse, la aplicación comprueba si hay una versión
+nueva en GitHub y pregunta si quieres instalarla (también desde *Ayuda >
+Buscar actualizaciones…*). Descarga el `.dmg`, comprueba su huella SHA-256
+con la que publica GitHub, sustituye la aplicación y la vuelve a abrir. Se
+puede desactivar en *Ayuda > Buscar actualizaciones al abrir*. Si Conversor no
+está en una carpeta en la que puedas escribir, abre la página de descarga.
+
 Para publicar una versión nueva: sube la versión en `pyproject.toml` y
 `src/conversor/__init__.py` y añade sus cambios a `CHANGELOG.md`. Después, en
 la pestaña *Actions*, elige «Aplicación para Mac», pulsa *Run workflow*, marca

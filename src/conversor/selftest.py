@@ -116,7 +116,41 @@ def run(with_gui: bool = True) -> list[str]:
     return problems
 
 
+def install_test(dmg: Path) -> list[str]:
+    """Instala el .dmg sobre una versión anterior falsa, como haría el actualizador (solo macOS)."""
+    import plistlib
+    import subprocess
+
+    from . import __version__, update
+
+    with tempfile.TemporaryDirectory(prefix="conversor-instalacion-") as tmp:
+        app = Path(tmp) / "Aplicaciones" / "Conversor.app"
+        (app / "Contents").mkdir(parents=True)
+        with open(app / "Contents" / "Info.plist", "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": update.BUNDLE_ID, "CFBundleShortVersionString": "0.0.1"}, f)
+        staged = update.stage(dmg, app, __version__)
+        finished = subprocess.Popen(["true"])
+        finished.wait()
+        update.replace_after_exit(app, staged, pid=finished.pid, relaunch=False).wait(timeout=60)
+        update.check_app(app, __version__)
+        if not (app / "Contents" / "MacOS" / "Conversor").exists():
+            return ["la aplicación instalada no tiene ejecutable"]
+        leftovers = sorted(p.name for p in app.parent.iterdir())
+        if leftovers != ["Conversor.app"]:
+            return [f"quedan restos de la instalación: {leftovers}"]
+    return []
+
+
 def main() -> int:
+    if "--instalacion" in sys.argv:
+        dmg = Path(sys.argv[sys.argv.index("--instalacion") + 1])
+        try:
+            problems = install_test(dmg)
+        except Exception as error:  # noqa: BLE001
+            print(f"Prueba de instalación: ERROR {type(error).__name__}: {error}")
+            return 1
+        print("Prueba de instalación: " + ("todo correcto" if not problems else "; ".join(problems)))
+        return 1 if problems else 0
     try:
         problems = run(with_gui="--sin-interfaz" not in sys.argv)
     except Exception as error:  # noqa: BLE001 - se informa del fallo

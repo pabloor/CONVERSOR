@@ -43,6 +43,9 @@ jobs:
           # La aplicación declara los tipos de archivo que abre (Dock, «Abrir con»).
           test "$(plutil -extract CFBundleDocumentTypes.0.CFBundleTypeExtensions.0 raw dist/Conversor.app/Contents/Info.plist)" = als
 
+      - name: Prueba de instalación (como el actualizador)
+        run: python -m conversor.selftest --instalacion dist/Conversor.dmg
+
       - uses: actions/upload-artifact@v4
         with:
           name: Conversor-mac

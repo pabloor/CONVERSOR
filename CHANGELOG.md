@@ -1,5 +1,13 @@
 # Cambios
 
+## 0.3.0
+
+- Actualizaciones automáticas: al abrirse, la aplicación comprueba si hay una
+  versión nueva en GitHub y pregunta si se quiere instalar. La descarga se
+  comprueba con su SHA-256 antes de sustituir la aplicación.
+- Menú Ayuda: «Buscar actualizaciones…», «Buscar actualizaciones al abrir» y
+  página de versiones.
+
 ## 0.2.0
 
 - Marcadores (locators) de Ableton en el MIDI: Logic los importa como marcadores.

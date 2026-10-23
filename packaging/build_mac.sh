@@ -28,8 +28,9 @@ pyinstaller --noconfirm --clean --windowed \
 
 if [[ "$(uname)" == "Darwin" ]]; then
     plist=dist/Conversor.app/Contents/Info.plist
-    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$plist"
-    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$plist"
+    # -replace crea la clave si no existe.
+    plutil -replace CFBundleShortVersionString -string "$VERSION" "$plist"
+    plutil -replace CFBundleVersion -string "$VERSION" "$plist"
     # Firma ad hoc (sin cuenta de desarrollador de Apple) tras editar el Info.plist.
     codesign --force --deep --sign - dist/Conversor.app
 

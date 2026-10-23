@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .audio import prepare
 from .formats import aaf, ableton, midi
 from .model import Project, TempoPoint, TrackKind
 
@@ -50,6 +52,7 @@ tempo, también Archivo > Exportar > MIDI. Abre los dos archivos a la vez.
 class Result:
     project: Project
     outputs: list[Path] = field(default_factory=list)
+    rendered_clips: int = 0
 
 
 def supported_extensions() -> list[str]:
@@ -121,8 +124,17 @@ def convert(
 
     if "aaf" in targets and has_audio:
         path = output_dir / f"{name}.aaf"
-        aaf.write(project, path)
+        with tempfile.TemporaryDirectory(prefix="conversor-") as workdir:
+            prepared = prepare(project, Path(workdir))
+            aaf.write(project, path, prepared)
+        result.rendered_clips = prepared.rendered
         result.outputs.append(path)
+    if "aaf" in targets and has_midi and _from_ableton(paths):
+        project.warn(
+            "Las pistas MIDI se exportan como notas, sin el sonido de sus instrumentos. "
+            "Para llevar también su audio, en Ableton usa «Congelar y aplanar» "
+            "(Freeze and Flatten) en esas pistas antes de convertir."
+        )
     if "midi" in targets and has_midi:
         path = output_dir / f"{name}.mid"
         midi.write(project, path)
@@ -138,6 +150,10 @@ def convert(
     report.write_text(build_report(result), encoding="utf-8")
     result.outputs.append(report)
     return result
+
+
+def _from_ableton(paths) -> bool:
+    return any(Path(p).suffix.lower() == ".als" for p in paths)
 
 
 def summary(project: Project) -> str:
@@ -173,6 +189,12 @@ def _count(n: int, singular: str, plural: str) -> str:
 
 def build_report(result: Result) -> str:
     parts = [summary(result.project), ""]
+    if result.rendered_clips:
+        parts.append(
+            f"Se han procesado {_count(result.rendered_clips, 'clip', 'clips')} de audio con warp, "
+            "transposición o Re-Pitch para que suenen como en Ableton."
+        )
+        parts.append("")
     if result.outputs:
         parts.append("Archivos generados:")
         parts.extend(f"  - {p.parent.name + '/' if p.suffix == '.als' else ''}{p.name}" for p in result.outputs)

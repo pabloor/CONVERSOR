@@ -45,6 +45,18 @@ class Note:
 
 
 @dataclass
+class AudioSegment:
+    """Tramo de un clip en el que la reproducción avanza de forma lineal:
+    los tiempos [start, end) de la línea de tiempo suenan con los segundos
+    [source_start, source_end) del archivo."""
+
+    start: float
+    end: float
+    source_start: float
+    source_end: float
+
+
+@dataclass
 class AudioClip:
     name: str
     start: float  # tiempos
@@ -52,6 +64,24 @@ class AudioClip:
     file: Path | None
     source_offset: float = 0.0  # segundos dentro del archivo
     gain_db: float = 0.0
+    # Cómo se reproduce el archivo (warp, bucles). Si está vacío, el archivo
+    # suena a su velocidad original desde source_offset.
+    segments: list[AudioSegment] = field(default_factory=list)
+    transpose: float = 0.0  # semitonos (sin cambiar la velocidad)
+    # Si es True, los cambios de velocidad también cambian el tono (Re-Pitch).
+    repitch: bool = False
+    # Modo de warp de Ableton, para elegir cómo estirar el audio.
+    warp_mode: int | None = None
+
+    def playback(self, project: Project) -> list[AudioSegment]:
+        if self.segments:
+            return self.segments
+        seconds = project.beats_to_seconds(self.start + self.length) - project.beats_to_seconds(self.start)
+        return [
+            AudioSegment(
+                self.start, self.start + self.length, self.source_offset, self.source_offset + seconds
+            )
+        ]
 
 
 @dataclass

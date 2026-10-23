@@ -4,8 +4,9 @@ Pro Tools, Logic Pro y Cubase/Nuendo importan AAF con las pistas, los clips en
 su posición y el audio incrustado. El audio se incrusta en el propio .aaf, así
 que el archivo resultante se puede mover a otro equipo sin perder medios.
 
-Escritura: solo se incrustan archivos WAV PCM; la mezcla (volumen, panorama)
-y la automatización no se escriben en el AAF.
+Escritura: el audio se prepara antes (ver `conversor.audio`) para que cada
+clip suene como en la sesión de origen. Se escriben también el volumen y el
+panorama de cada pista con su automatización, y la ganancia de cada clip.
 
 Lectura: pensada para los AAF que exporta Pro Tools, con el audio incrustado o
 enlazado a archivos externos. El AAF no lleva el tempo de la sesión, así que
@@ -18,6 +19,7 @@ from __future__ import annotations
 import re
 import struct
 import sys
+import tempfile
 import urllib.parse
 import wave
 from fractions import Fraction
@@ -39,6 +41,7 @@ from aaf2.misc import ConstantValue, VaryingValue
 from aaf2.mobid import MobID
 from aaf2.mobs import MasterMob, SourceMob
 
+from ..audio import PreparedAudio, prepare
 from ..model import (
     AudioClip,
     Automation,
@@ -46,92 +49,170 @@ from ..model import (
     Project,
     Track,
     TrackKind,
+    db_to_gain,
     gain_to_db,
 )
 
-DEFAULT_SAMPLE_RATE = 48000
+# Definiciones estándar de AAF (AAF SDK) para ganancia y panorama de audio.
+# Pro Tools, Logic y Cubase las reconocen al importar.
+_MONO_AUDIO_GAIN = "9d2ea893-0968-11d3-8a38-0050040ef7d2"
+_MONO_AUDIO_PAN = "9d2ea894-0968-11d3-8a38-0050040ef7d2"
+_AMPLITUDE = "e4962320-2267-11d3-8a4c-0050040ef7d2"
+_PAN = "e4962322-2267-11d3-8a4c-0050040ef7d2"
+_LINEAR_INTERP = "5b6c85a4-0ede-11d3-80a9-006008143e6f"
 
 
-def write(project: Project, path: str | Path) -> int:
-    """Escribe las pistas de audio del proyecto. Devuelve el número de clips escritos."""
-    sources = _usable_sources(project)
-    rate = _session_rate(sources.values())
-    for file, file_rate in sources.items():
-        if file_rate != rate:
-            project.warn(
-                f"'{file.name}' está a {file_rate} Hz y la sesión a {rate} Hz; "
-                "conviértelo a la misma frecuencia o sonará a otra velocidad."
-            )
+def write(project: Project, path: str | Path, prepared: PreparedAudio | None = None) -> int:
+    """Escribe las pistas de audio del proyecto. Devuelve el número de clips escritos.
 
+    Si no se pasa el audio ya preparado, se prepara en una carpeta temporal.
+    """
+    if prepared is None:
+        with tempfile.TemporaryDirectory(prefix="conversor-") as workdir:
+            return write(project, path, prepare(project, Path(workdir)))
+
+    rate = prepared.rate
     clip_count = 0
     with aaf2.open(str(path), "w") as f:
+        defs = _Definitions(f)
         composition = f.create.CompositionMob(project.name)
         composition.usage = "Usage_TopLevel"
         f.content.mobs.append(composition)
         master_mobs: dict[Path, tuple[object, int]] = {}
-        audio_tracks = [t for t in project.tracks if t.kind == TrackKind.AUDIO]
 
-        for number, track in enumerate(audio_tracks, start=1):
-            slot = composition.create_sound_slot(edit_rate=rate)
+        for number, (track, regions) in enumerate(prepared.tracks, start=1):
+            slot = composition.create_timeline_slot(edit_rate=rate)
             slot.name = track.name
             slot["PhysicalTrackNumber"].value = number
-            sequence = slot.segment
+            sequence = f.create.Sequence(media_kind="sound")
             cursor = 0
 
-            for clip in sorted(track.audio_clips, key=lambda c: c.start):
-                if clip.file is None or clip.file not in sources:
-                    continue
-                if clip.file not in master_mobs:
-                    master = f.create.MasterMob(clip.file.stem)
+            for region in regions:
+                if region.file not in master_mobs:
+                    master = f.create.MasterMob(region.file.stem)
                     f.content.mobs.append(master)
-                    source_slot = master.import_audio_essence(str(clip.file), edit_rate=rate)
-                    master_mobs[clip.file] = (master, source_slot.segment.length)
-                master, source_length = master_mobs[clip.file]
+                    source_slot = master.import_audio_essence(str(region.file), edit_rate=rate)
+                    master_mobs[region.file] = (master, source_slot.segment.length)
+                master, source_length = master_mobs[region.file]
 
-                start = _samples(project.beats_to_seconds(clip.start), rate)
-                end = _samples(project.beats_to_seconds(clip.start + clip.length), rate)
-                offset = _samples(clip.source_offset, rate)
+                start = _samples(region.start, rate)
+                offset = _samples(region.offset, rate)
+                length = min(_samples(region.start + region.length, rate) - start, source_length - offset)
                 if start < cursor:
                     # Clips solapados: se recorta el principio del clip posterior.
                     offset += cursor - start
+                    length -= cursor - start
                     start = cursor
-                length = min(end - start, source_length - offset)
                 if length <= 0:
                     continue
                 if start > cursor:
                     sequence.components.append(f.create.Filler("sound", start - cursor))
-                source_clip = master.create_source_clip(slot_id=1, start=offset, length=length)
-                sequence.components.append(source_clip)
+                clip = master.create_source_clip(slot_id=1, start=offset, length=length)
+                if abs(region.gain_db) > 0.01:
+                    clip = defs.gain_group(clip, length, constant=db_to_gain(region.gain_db))
+                sequence.components.append(clip)
                 cursor = start + length
                 clip_count += 1
+
+            slot.segment = _track_mixer(project, track, sequence, cursor, rate, defs, f)
+            _warn_mix(project, track)
 
     return clip_count
 
 
-def _usable_sources(project: Project) -> dict[Path, int]:
-    """Archivos que se pueden incrustar, con su frecuencia de muestreo."""
-    sources: dict[Path, int] = {}
-    for track in project.tracks:
-        for clip in track.audio_clips:
-            file = clip.file
-            if file is None or file in sources or not file.exists():
-                continue
-            try:
-                with wave.open(str(file), "rb") as wav:
-                    sources[file] = wav.getframerate()
-            except (wave.Error, EOFError):
-                project.warn(
-                    f"'{file.name}' no es un WAV PCM; no se incluye en el AAF. "
-                    "Conviértelo a WAV (16 o 24 bits) antes de exportar."
-                )
-    return sources
+def _track_mixer(project: Project, track: Track, sequence, length: int, rate: int, defs, f):
+    """Envuelve la secuencia de la pista con su volumen y panorama (y su automatización)."""
+    automation = {a.parameter: a for a in track.automation}
+    last = [
+        _samples(project.beats_to_seconds(p.beat), rate)
+        for a in automation.values()
+        if a.parameter in ("volume", "pan")
+        for p in a.points
+    ]
+    total = max([length] + [x + 1 for x in last])
+    if total > length:
+        sequence.components.append(f.create.Filler("sound", total - length))
+    segment = sequence
+
+    volume = automation.get("volume")
+    if volume and len(volume.points) > 1:
+        points = [(project.beats_to_seconds(p.beat) * rate / total, db_to_gain(p.value)) for p in volume.points]
+        segment = defs.gain_group(segment, total, points=points)
+    elif abs(track.volume_db) > 0.01:
+        segment = defs.gain_group(segment, total, constant=db_to_gain(track.volume_db))
+
+    pan = automation.get("pan")
+    if pan and len(pan.points) > 1:
+        points = [(project.beats_to_seconds(p.beat) * rate / total, (p.value + 1) / 2) for p in pan.points]
+        segment = defs.pan_group(segment, total, points=points)
+    elif abs(track.pan) > 0.001:
+        segment = defs.pan_group(segment, total, constant=(track.pan + 1) / 2)
+    return segment
 
 
-def _session_rate(rates) -> int:
-    rates = list(rates)
-    if not rates:
-        return DEFAULT_SAMPLE_RATE
-    return max(set(rates), key=rates.count)
+def _warn_mix(project: Project, track: Track) -> None:
+    if track.mute:
+        project.warn(f"La pista '{track.name}' está silenciada en Ableton; se exporta igualmente.")
+    if track.solo:
+        project.warn(f"La pista '{track.name}' tiene el solo activado en Ableton; el solo no se exporta.")
+    if any(a.parameter == "mute" for a in track.automation):
+        project.warn(f"La automatización de silencio de la pista '{track.name}' no se exporta.")
+
+
+class _Definitions:
+    """Registra en el AAF las operaciones de ganancia y panorama la primera vez que se usan."""
+
+    def __init__(self, f):
+        self.f = f
+        self.defs: dict[str, object] = {}
+
+    def _operation(self, auid: str, name: str, parameter_auid: str, parameter_name: str):
+        if auid in self.defs:
+            return self.defs[auid], self.defs[parameter_auid]
+        f = self.f
+        parameter = f.create.ParameterDef(parameter_auid, parameter_name, "", "Rational")
+        f.dictionary.register_def(parameter)
+        operation = f.create.OperationDef(auid, name, "")
+        operation.media_kind = "sound"
+        operation["IsTimeWarp"].value = False
+        operation["NumberInputs"].value = 1
+        operation["ParametersDefined"].append(parameter)
+        f.dictionary.register_def(operation)
+        self.defs[auid], self.defs[parameter_auid] = operation, parameter
+        return operation, parameter
+
+    def _interpolation(self):
+        if _LINEAR_INTERP not in self.defs:
+            interpolation = self.f.create.InterpolationDef(_LINEAR_INTERP, "LinearInterp", "")
+            self.f.dictionary.register_def(interpolation)
+            self.defs[_LINEAR_INTERP] = interpolation
+        return self.defs[_LINEAR_INTERP]
+
+    def _group(self, operation, parameter, segment, length, constant, points):
+        group = self.f.create.OperationGroup(operation, length=length, media_kind="sound")
+        group.segments.append(segment)
+        if points:
+            value = self.f.create.VaryingValue()
+            value.parameterdef = parameter
+            value["Interpolation"].value = self._interpolation()
+            for time, amount in points:
+                value.add_keyframe(_rational(min(max(time, 0.0), 1.0)), _rational(amount))
+        else:
+            value = self.f.create.ConstantValue(parameter, _rational(constant))
+        group.parameters.append(value)
+        return group
+
+    def gain_group(self, segment, length, constant=1.0, points=None):
+        operation, parameter = self._operation(_MONO_AUDIO_GAIN, "Mono Audio Gain", _AMPLITUDE, "Amplitude")
+        return self._group(operation, parameter, segment, length, constant, points)
+
+    def pan_group(self, segment, length, constant=0.5, points=None):
+        operation, parameter = self._operation(_MONO_AUDIO_PAN, "Mono Audio Pan", _PAN, "Pan")
+        return self._group(operation, parameter, segment, length, constant, points)
+
+
+def _rational(value: float) -> Fraction:
+    return Fraction(value).limit_denominator(1 << 20)
 
 
 def _samples(seconds: float, rate: int) -> int:
@@ -192,25 +273,40 @@ class _AAFReader:
             existing.add(unique)
             track = Track(name=unique, kind=TrackKind.AUDIO)
             rate = float(slot.edit_rate)
-            if isinstance(segment, OperationGroup) and _gain_parameter(segment) is not None:
-                self._track_gain(track, segment, rate)
+            # Volumen y panorama de la pista: grupos que envuelven toda la secuencia.
+            while isinstance(segment, OperationGroup) and len(segment.segments) == 1:
+                if _gain_parameter(segment) is not None:
+                    self._track_parameter(track, segment, rate, _gain_parameter(segment), "volume")
+                elif _pan_parameter(segment) is not None:
+                    self._track_parameter(track, segment, rate, _pan_parameter(segment), "pan")
+                else:
+                    break
+                segment = segment.segments[0]
             self._walk(segment, 0, rate, track, 0.0)
             self.project.tracks.append(track)
 
-    def _track_gain(self, track: Track, group, rate: float) -> None:
-        parameter = _gain_parameter(group)
+    def _track_parameter(self, track: Track, group, rate: float, parameter, name: str) -> None:
+        if name == "volume":
+            convert = lambda v: gain_to_db(float(v))  # noqa: E731
+        else:
+            convert = lambda v: float(v) * 2 - 1  # noqa: E731
         if isinstance(parameter, ConstantValue):
-            track.volume_db = gain_to_db(float(parameter.value))
-        elif isinstance(parameter, VaryingValue):
+            value = convert(parameter.value)
             points = []
-            for point in parameter.pointlist:
-                seconds = float(point.time) * group.length / rate
-                points.append(
-                    AutomationPoint(self.project.seconds_to_beats(seconds), gain_to_db(float(point.value)))
+        else:
+            points = [
+                AutomationPoint(
+                    self.project.seconds_to_beats(float(p.time) * group.length / rate), convert(p.value)
                 )
-            if points:
-                track.volume_db = points[0].value
-                track.automation.append(Automation("volume", points))
+                for p in parameter.pointlist
+            ]
+            value = points[0].value if points else 0.0
+        if name == "volume":
+            track.volume_db = value
+        else:
+            track.pan = value
+        if points:
+            track.automation.append(Automation(name, points))
 
     def _walk(self, segment, position: int, rate: float, track: Track, gain_db: float) -> int:
         """Recorre un segmento a partir de `position` (en unidades de `rate`)."""
@@ -380,6 +476,13 @@ def _gain_parameter(group):
     for parameter in group.parameters:
         name = (parameter.name or "").lower()
         if "amplitude" in name or "gain" in name or "level" in name:
+            return parameter
+    return None
+
+
+def _pan_parameter(group):
+    for parameter in group.parameters:
+        if "pan" in (parameter.name or "").lower():
             return parameter
     return None
 

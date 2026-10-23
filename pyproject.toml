@@ -12,6 +12,11 @@ dependencies = [
     "pyaaf2>=1.7",
     "mido>=1.3",
     "PySide6>=6.6",
+    "numpy>=1.24",
+    "soundfile>=0.12",
+    "soxr>=0.3",
+    # Rubber Band, para estirar el audio con warp. No hay versión para Mac con Intel.
+    "pylibrb>=0.1; python_version >= '3.12' and (sys_platform != 'darwin' or platform_machine != 'x86_64')",
 ]
 
 [project.optional-dependencies]

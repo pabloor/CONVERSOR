@@ -19,9 +19,20 @@ def test_aaf_places_clips_on_timeline(als_session, tmp_path):
         (slot,) = list(composition.slots)
         assert slot.name == "Bombo"
         assert slot.edit_rate == 48000
-        components = list(slot.segment.components)
+        # Panorama y volumen de la pista envuelven la secuencia de clips.
+        pan = slot.segment
+        assert pan.operation.name == "Mono Audio Pan"
+        assert float(next(iter(pan.parameters)).value) == 0.25
+        gain = pan.segments[0]
+        assert gain.operation.name == "Mono Audio Gain"
+        points = [(float(p.time), round(float(p.value), 3)) for p in next(iter(gain.parameters)).pointlist]
+        # Automatización: 0 dB al principio y -6 dB en el tiempo 8 (4 s)
+        assert points[0][1] == 1.0 and points[-1][1] == 0.5
+        assert points[-1][0] * gain.length == 4 * 48000
+
+        components = list(gain.segments[0].components)
         kinds = [type(c).__name__ for c in components]
-        assert kinds == ["Filler", "SourceClip", "Filler", "SourceClip"]
+        assert kinds[:4] == ["Filler", "SourceClip", "Filler", "SourceClip"]
         # 120 BPM: tiempo 4 = 2 s, longitud 4 tiempos = 2 s, desplazamiento 0,5 s
         assert components[0].length == 96000
         assert (components[1].start, components[1].length) == (24000, 96000)
@@ -29,6 +40,16 @@ def test_aaf_places_clips_on_timeline(als_session, tmp_path):
         # Segundo clip: 1 s de duración, empieza en 0,5 s del archivo
         assert (components[3].start, components[3].length) == (24000, 48000)
         assert len(list(f.content.mastermobs())) == 1
+
+
+def test_aaf_mixer_round_trip(als_session, tmp_path):
+    from conversor.formats import aaf
+
+    convert(als_session, tmp_path, targets=("aaf",))
+    (drums,) = aaf.read(tmp_path / "Demo.aaf").tracks
+    assert drums.pan == -0.5
+    (volume,) = drums.automation
+    assert [(round(p.beat, 3), round(p.value, 2)) for p in volume.points] == [(0, 0.0), (8, -6.02)]
 
 
 def test_midi_contains_tempo_and_unrolled_notes(als_session, tmp_path):

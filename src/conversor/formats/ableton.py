@@ -21,6 +21,7 @@ from pathlib import Path
 
 from ..model import (
     AudioClip,
+    AudioSegment,
     Automation,
     AutomationPoint,
     MidiClip,
@@ -45,6 +46,10 @@ _TRACK_KINDS = {
 }
 
 _DENOMINATORS = [1, 2, 4, 8, 16]
+
+# Modos de warp de Ableton (WarpMode): 0 Beats, 1 Tones, 2 Texture, 3 Re-Pitch,
+# 4 Complex, 6 Complex Pro.
+_WARP_REPITCH = 3
 
 
 def read(path: str | Path) -> Project:
@@ -202,7 +207,9 @@ class _Reader:
                     track.audio_clips.append(audio)
         if kind == TrackKind.MIDI and sequencer is not None:
             for clip in sequencer.iterfind("ClipTimeable/ArrangerAutomation/Events/MidiClip"):
-                track.midi_clips.append(self._midi_clip(clip))
+                midi = self._midi_clip(clip)
+                if midi is not None:
+                    track.midi_clips.append(midi)
         if kind in (TrackKind.GROUP, TrackKind.RETURN):
             self.project.warn(
                 f"La pista '{name}' es un {'grupo' if kind == TrackKind.GROUP else 'retorno'}: "
@@ -246,49 +253,87 @@ class _Reader:
 
     def _audio_clip(self, clip: ET.Element, track_name: str) -> AudioClip | None:
         name = _value(clip, "Name") or ""
+        label = f"'{name or track_name}' (pista '{track_name}')"
+        if _bool(clip, "Disabled"):
+            self.project.warn(f"El clip {label} está desactivado en Ableton; no se exporta.")
+            return None
         start = _float(clip, "CurrentStart", float(clip.get("Time", "0")))
         end = _float(clip, "CurrentEnd", start)
+        if end <= start:
+            return None
         loop_start = _float(clip, "Loop/LoopStart")
         loop_end = _float(clip, "Loop/LoopEnd")
         content_start = loop_start + _float(clip, "Loop/StartRelative")
+        looped = _bool(clip, "Loop/LoopOn")
         warped = _bool(clip, "IsWarped", True)
-        label = f"'{name or track_name}' (pista '{track_name}')"
+        warp_mode = int(_float(clip, "WarpMode", 0))
+        transpose = _float(clip, "PitchCoarse") + _float(clip, "PitchFine") / 100.0
 
         if warped:
+            # Contenido en tiempos del clip; los warp markers lo llevan a segundos del archivo.
             markers = sorted(
                 (float(m.get("BeatTime", "0")), float(m.get("SecTime", "0")))
                 for m in clip.iterfind("WarpMarkers/WarpMarker")
             )
-            offset = _warp_beat_to_seconds(markers, content_start)
-            clip_seconds = _warp_beat_to_seconds(markers, content_start + (end - start)) - offset
-            timeline_seconds = self.project.beats_to_seconds(end) - self.project.beats_to_seconds(start)
-            if timeline_seconds > 0 and abs(clip_seconds / timeline_seconds - 1) > 0.005:
-                self.project.warn(
-                    f"El clip {label} está estirado (warp) respecto al tempo de la sesión; "
-                    "se exporta sin estirar. Consolídalo en Ableton (Ctrl+J) para conservar el resultado."
-                )
+            marker_beats = [b for b, _ in markers]
+            segments = []
+            for t0, t1, c0, _ in _loop_pieces(end - start, content_start, loop_start, loop_end, looped):
+                cuts = [c0] + [b for b in marker_beats if c0 < b < c0 + (t1 - t0)] + [c0 + (t1 - t0)]
+                for a, b in zip(cuts, cuts[1:]):
+                    segments.append(
+                        AudioSegment(
+                            start + t0 + (a - c0),
+                            start + t0 + (b - c0),
+                            _warp_beat_to_seconds(markers, a),
+                            _warp_beat_to_seconds(markers, b),
+                        )
+                    )
+            repitch = warp_mode == _WARP_REPITCH
         else:
-            offset = content_start
-
-        looped = _bool(clip, "Loop/LoopOn")
-        if looped and (end - start) > (loop_end - content_start) + 1e-6:
-            self.project.warn(
-                f"El clip {label} se repite en bucle; solo se exporta la primera vuelta. "
-                "Consolídalo en Ableton para conservar las repeticiones."
-            )
+            # Sin warp, el audio avanza en segundos reales; la transposición
+            # cambia la velocidad, como en un sampler.
+            speed = 2.0 ** (transpose / 12.0)
+            first = self.project.beats_to_seconds(start)
+            total = self.project.beats_to_seconds(end) - first
+            segments = []
+            for t0, t1, c0, c1 in _loop_pieces(total, content_start, loop_start, loop_end, looped, speed):
+                b0 = self.project.seconds_to_beats(first + t0)
+                b1 = self.project.seconds_to_beats(first + t1)
+                cuts = [b0] + _tempo_breaks(self.project, b0, b1) + [b1]
+                for a, b in zip(cuts, cuts[1:]):
+                    sa = self.project.beats_to_seconds(a) - first - t0
+                    sb = self.project.beats_to_seconds(b) - first - t0
+                    segments.append(AudioSegment(a, b, c0 + sa * speed, c0 + sb * speed))
+            if segments:
+                segments[-1].end = end
+            repitch = True
+        if not segments:
+            return None
 
         file = self._resolve_file(clip.find("SampleRef/FileRef"))
         if file is None or not file.exists():
             shown = file.name if file else "desconocido"
             self.project.warn(f"No se encuentra el archivo de audio '{shown}' del clip {label}.")
 
+        fade_in = _float(clip, "Fades/FadeInLength")
+        fade_out = _float(clip, "Fades/FadeOutLength")
+        if fade_in > 0.01 or fade_out > 0.01:
+            self.project.warn(
+                f"El clip {label} tiene fundidos; los formatos de intercambio no los "
+                "conservan y hay que rehacerlos en el otro DAW."
+            )
+
         return AudioClip(
             name=name or (file.stem if file else track_name),
             start=start,
             length=end - start,
             file=file,
-            source_offset=max(offset, 0.0),
+            source_offset=max(segments[0].source_start, 0.0) if segments else 0.0,
             gain_db=gain_to_db(_float(clip, "SampleVolume", 1.0)),
+            segments=segments,
+            transpose=0.0 if repitch else transpose,
+            repitch=repitch,
+            warp_mode=warp_mode if warped else None,
         )
 
     def _resolve_file(self, file_ref: ET.Element | None) -> Path | None:
@@ -318,8 +363,11 @@ class _Reader:
                 return found
         return candidates[0] if candidates else None
 
-    def _midi_clip(self, clip: ET.Element) -> MidiClip:
+    def _midi_clip(self, clip: ET.Element) -> MidiClip | None:
         name = _value(clip, "Name") or ""
+        if _bool(clip, "Disabled"):
+            self.project.warn(f"El clip MIDI '{name}' está desactivado en Ableton; no se exporta.")
+            return None
         start = _float(clip, "CurrentStart", float(clip.get("Time", "0")))
         length = _float(clip, "CurrentEnd", start) - start
         loop_start = _float(clip, "Loop/LoopStart")
@@ -342,19 +390,9 @@ class _Reader:
                     )
                 )
 
-        # Recorre el contenido como lo reproduce Ableton: desde content_start
-        # hasta el final del bucle y, si hay bucle, repite [loop_start, loop_end).
-        segments: list[tuple[float, float, float]] = []  # (inicio, fin, posición en el clip)
-        position = 0.0
-        seg_start = content_start
-        seg_end = loop_end if looped else content_start + length
-        while position < length - 1e-9 and seg_end > seg_start:
-            span = min(seg_end - seg_start, length - position)
-            segments.append((seg_start, seg_start + span, position))
-            position += span
-            if not looped:
-                break
-            seg_start, seg_end = loop_start, loop_end
+        segments = [
+            (c0, c1, t0) for t0, _, c0, c1 in _loop_pieces(length, content_start, loop_start, loop_end, looped)
+        ]
 
         notes: list[Note] = []
         for seg_start, seg_end, timeline_pos in segments:
@@ -364,6 +402,45 @@ class _Reader:
                     notes.append(Note(note.pitch, timeline_pos + note.start - seg_start, duration, note.velocity))
         notes.sort(key=lambda n: (n.start, n.pitch))
         return MidiClip(name=name, start=start, length=length, notes=notes)
+
+
+def _loop_pieces(total, content_start, loop_start, loop_end, looped, speed=1.0):
+    """Divide la reproducción de un clip en tramos sin saltos.
+
+    Devuelve (inicio, fin) en la línea de tiempo, relativos al clip, y
+    (inicio, fin) en el contenido. Sin bucle hay un solo tramo; con bucle, el
+    primero va de content_start al final del bucle y los demás repiten
+    [loop_start, loop_end). `speed` es cuánto avanza el contenido por unidad de tiempo.
+    """
+    pieces = []
+    position = 0.0
+    piece_start = content_start
+    piece_end = loop_end if looped else math.inf
+    while position < total - 1e-9:
+        span = min((piece_end - piece_start) / speed, total - position)
+        if span <= 1e-9:
+            break
+        pieces.append((position, position + span, piece_start, piece_start + span * speed))
+        position += span
+        if not looped:
+            break
+        piece_start, piece_end = loop_start, loop_end
+    return pieces
+
+
+def _tempo_breaks(project: Project, start: float, end: float) -> list[float]:
+    """Instantes entre start y end donde cambia el tempo (cada tiempo dentro de una rampa)."""
+    breaks = []
+    points = sorted(project.tempo_map, key=lambda p: p.beat)
+    for point, nxt in zip(points, points[1:] + [None]):
+        if start < point.beat < end:
+            breaks.append(point.beat)
+        if point.ramp and nxt is not None:
+            beat = math.floor(max(point.beat, start)) + 1
+            while beat < min(nxt.beat, end):
+                breaks.append(float(beat))
+                beat += 1
+    return sorted(set(breaks))
 
 
 def _warp_beat_to_seconds(markers: list[tuple[float, float]], beat: float) -> float:

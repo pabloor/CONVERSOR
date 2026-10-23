@@ -10,13 +10,28 @@ Aplicación de escritorio para pasar sesiones de un DAW a otro.
 
 | Archivo | Contenido | Se abre en |
 |---|---|---|
-| `.aaf` | Pistas de audio con sus clips colocados en la línea de tiempo y el audio incrustado | Pro Tools, Logic Pro, Cubase/Nuendo |
+| `.aaf` | Pistas de audio con sus clips en su posición, el audio incrustado, el volumen y el panorama de cada pista (con su automatización) y la ganancia de cada clip | Pro Tools, Logic Pro, Cubase/Nuendo |
 | `.mid` | Pistas MIDI con notas, tempo (incluidos los cambios), compás, volumen y panorama | Todos (también FL Studio) |
 | `informe.txt` | Resumen de la sesión, avisos sobre lo que no se ha podido convertir y cómo importar en cada DAW | — |
 
 Pro Tools, Logic y Cubase guardan sus sesiones en formatos cerrados que no se
 pueden escribir directamente. AAF y MIDI son los formatos de intercambio que
 todos ellos importan.
+
+El objetivo es que el audio suene exactamente como en Ableton:
+
+- **Clips sin cambios** (a la velocidad original del archivo): el AAF
+  referencia el archivo completo. Conservan los márgenes para alargarlos en el
+  otro DAW.
+- **Clips con warp** que estiran el audio (por ejemplo, un loop de 100 BPM en
+  una sesión a 128), con varios warp markers o con transposición: se procesan
+  con [Rubber Band](https://breakfastquay.com/rubberband/), el mismo motor de
+  estiramiento que usan otros DAW. En modo Re-Pitch, y en clips sin warp
+  transpuestos, se cambia la velocidad como hace Ableton.
+- **Clips en bucle**: cada vuelta se exporta como un clip.
+- **AIFF, MP3, FLAC u otra frecuencia de muestreo**: se convierten a WAV de 24
+  bits a la frecuencia de la sesión.
+- **Clips desactivados**: no se exportan.
 
 ### De Pro Tools a Ableton Live
 
@@ -48,18 +63,26 @@ etc.
 ### Limitaciones conocidas
 
 - Ableton: solo se leen los clips del arreglo (Arrangement), no los de la vista Session.
-- El AAF solo incrusta audio WAV PCM. Los AIFF, MP3 o FLAC hay que convertirlos antes a WAV.
-- Los clips de audio estirados con warp o repetidos en bucle se exportan sin
-  estirar y sin repetir. Consolídalos en Ableton (Ctrl+J / Cmd+J) antes de convertir.
-- La mezcla y la automatización de las pistas de audio todavía no se escriben en
-  el AAF. En las pistas MIDI se exportan como CC7 (volumen) y CC10 (panorama).
-- Los grupos, los retornos y los plugins no se convierten.
-- Pro Tools: los fundidos y los crossfades no se convierten. El audio en MXF
+- No se convierten los efectos y los instrumentos (plugins). Para llevar el
+  sonido de una pista MIDI o con efectos, usa en Ableton «Congelar y aplanar»
+  (Freeze and Flatten) antes de convertir.
+- No se convierten los fundidos de los clips ni las envolventes dentro de los
+  clips. El informe avisa de los clips con fundidos.
+- Los grupos y los retornos no se convierten, y el silencio y el solo de las
+  pistas tampoco. El informe lo avisa.
+- En los clips procesados con Rubber Band, los golpes pueden adelantarse unos
+  milisegundos, como en cualquier estiramiento de tiempo.
+- Rubber Band (`pylibrb`) necesita Python 3.12 o posterior y no tiene versión
+  para Mac con Intel. Sin él, los clips estirados se exportan sin estirar y el
+  informe lo avisa.
+- Falta comprobarlo con sesiones reales en Pro Tools, Logic y Cubase,
+  sobre todo las pistas estéreo y la automatización en Pro Tools.
+- Pro Tools → Ableton: los fundidos y los crossfades no se convierten. El audio en MXF
   (exportación «compatible con Avid») no lo abre Ableton; exporta en WAV.
 
 ## Instalación
 
-Hace falta Python 3.10 o posterior.
+Hace falta Python 3.12 o posterior (3.10 funciona, pero sin Rubber Band).
 
 ```bash
 pip install -e .
@@ -99,6 +122,7 @@ Estructura:
 - `src/conversor/model.py`: modelo intermedio (pistas, clips, notas, tempo, automatización).
 - `src/conversor/formats/`: un módulo por formato, cada uno con `read` y/o `write` (`ableton.py`, `aaf.py`, `midi.py`).
 - `src/conversor/templates/`: plantilla de set de Ableton usada al escribir `.als`.
+- `src/conversor/audio.py`: prepara el audio de cada clip (warp, bucles, transposición, conversión de formato).
 - `src/conversor/convert.py`: une lectores y escritores y genera el informe.
 - `src/conversor/gui.py`: aplicación de escritorio (PySide6).
 - `src/conversor/cli.py`: línea de comandos.
